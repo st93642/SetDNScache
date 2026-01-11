@@ -1,0 +1,23 @@
+# Ignore log files
+*.log
+
+# Ignore temporary files
+*.tmp
+*.swp
+
+# Ignore system-specific files
+/tmp/
+/var/
+
+# Ignore backup files
+*.bak
+
+# Ignore IDE-specific files
+.idea/
+.vscode/
+
+# Ignore macOS files
+.DS_Store
+
+# Ignore JSON reports in root
+*.json

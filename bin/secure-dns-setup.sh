@@ -4,7 +4,7 @@
 # Configures Stubby with DNS-over-TLS and DNSSEC validation
 # Primary: Cloudflare | Secondary: Quad9 | Tertiary: Google
 #
-# Usage: sudo ./secure-dns-setup.sh [--run-tests] [--rollback]
+# Usage: sudo ./secure-dns-setup.sh [--run-tests] [--test-reboot] [--rollback]
 #
 
 set -euo pipefail
@@ -82,7 +82,7 @@ log_section() {
 check_root() {
     if [ "$EUID" -ne 0 ]; then
         log ERROR "This script must be run as root (use sudo)"
-        log INFO "Usage: sudo $0 [--run-tests] [--rollback]"
+        log INFO "Usage: sudo $0 [--run-tests] [--test-reboot] [--rollback]"
         exit 1
     fi
 }
@@ -904,6 +904,7 @@ USAGE:
 
 OPTIONS:
     --run-tests     Run connectivity tests only (no configuration changes)
+    --test-reboot   Run comprehensive reboot survival tests
     --rollback      Restore previous configuration and exit
     --verbose       Enable verbose output
     --dry-run       Show what would be done without making changes
@@ -912,6 +913,7 @@ OPTIONS:
 EXAMPLES:
     sudo $0                     # Configure secure DNS
     sudo $0 --run-tests         # Run connectivity tests only
+    sudo $0 --test-reboot       # Run comprehensive reboot survival tests
     sudo $0 --rollback          # Rollback to previous configuration
     sudo $0 --verbose           # Run with verbose output
 
@@ -942,6 +944,37 @@ HELP
 }
 
 # ============================================================================
+# Reboot Test Function
+# ============================================================================
+
+run_reboot_tests() {
+    log INFO "Running comprehensive reboot survival tests..."
+    
+    # Check if test scripts exist
+    local pre_reboot_script="/home/engine/project/tests/pre-reboot-check.sh"
+    local post_reboot_script="/home/engine/project/tests/post-reboot-check.sh"
+    local reboot_helper="/home/engine/project/tests/reboot-test-helper.sh"
+    
+    if [ ! -f "$pre_reboot_script" ] || [ ! -f "$post_reboot_script" ] || [ ! -f "$reboot_helper" ]; then
+        log ERROR "Reboot test scripts not found. Please ensure tests directory exists."
+        log INFO "Expected location: /home/engine/project/tests/"
+        exit 1
+    fi
+    
+    # Check if scripts are executable
+    if [ ! -x "$pre_reboot_script" ] || [ ! -x "$post_reboot_script" ] || [ ! -x "$reboot_helper" ]; then
+        log ERROR "Reboot test scripts are not executable."
+        log INFO "Please run: chmod +x /home/engine/project/tests/*.sh"
+        exit 1
+    fi
+    
+    log INFO "Starting reboot test helper..."
+    
+    # Run the reboot test helper
+    "$reboot_helper"
+}
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
@@ -952,6 +985,10 @@ main() {
             --run-tests)
                 RUN_TESTS_ONLY=true
                 shift
+                ;;
+            --test-reboot)
+                run_reboot_tests
+                exit 0
                 ;;
             --rollback)
                 rollback
