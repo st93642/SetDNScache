@@ -950,21 +950,25 @@ HELP
 run_reboot_tests() {
     log INFO "Running comprehensive reboot survival tests..."
     
+    # Detect script directory for relative paths
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local project_root="$(dirname "$script_dir")"
+    
     # Check if test scripts exist
-    local pre_reboot_script="/home/engine/project/tests/pre-reboot-check.sh"
-    local post_reboot_script="/home/engine/project/tests/post-reboot-check.sh"
-    local reboot_helper="/home/engine/project/tests/reboot-test-helper.sh"
+    local pre_reboot_script="$project_root/tests/pre-reboot-check.sh"
+    local post_reboot_script="$project_root/tests/post-reboot-check.sh"
+    local reboot_helper="$project_root/tests/reboot-test-helper.sh"
     
     if [ ! -f "$pre_reboot_script" ] || [ ! -f "$post_reboot_script" ] || [ ! -f "$reboot_helper" ]; then
         log ERROR "Reboot test scripts not found. Please ensure tests directory exists."
-        log INFO "Expected location: /home/engine/project/tests/"
+        log INFO "Expected location: $project_root/tests/"
         exit 1
     fi
     
     # Check if scripts are executable
     if [ ! -x "$pre_reboot_script" ] || [ ! -x "$post_reboot_script" ] || [ ! -x "$reboot_helper" ]; then
         log ERROR "Reboot test scripts are not executable."
-        log INFO "Please run: chmod +x /home/engine/project/tests/*.sh"
+        log INFO "Please run: chmod +x $project_root/tests/*.sh"
         exit 1
     fi
     

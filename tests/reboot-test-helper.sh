@@ -12,9 +12,13 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Detect script directory for relative paths
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
 # Script paths
-PRE_REBOOT_SCRIPT="/home/engine/project/tests/pre-reboot-check.sh"
-POST_REBOOT_SCRIPT="/home/engine/project/tests/post-reboot-check.sh"
+PRE_REBOOT_SCRIPT="$PROJECT_ROOT/tests/pre-reboot-check.sh"
+POST_REBOOT_SCRIPT="$PROJECT_ROOT/tests/post-reboot-check.sh"
 JSON_REPORT="/var/log/dns-reboot-test-results.json"
 
 # Function to display ASCII art header

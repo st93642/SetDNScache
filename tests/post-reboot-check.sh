@@ -385,10 +385,23 @@ main() {
     echo ""
     echo "${YELLOW}Test 10: Pre-Reboot State Comparison${NC}"
     if compare_with_preboot; then
-        echo '      {"test": "pre_reboot_comparison", "status": "PASS"}' >> "$JSON_REPORT"
+        echo '      {"test": "pre_reboot_comparison", "status": "PASS"},' >> "$JSON_REPORT"
         ((pass_count++))
     else
-        echo '      {"test": "pre_reboot_comparison", "status": "FAIL"}' >> "$JSON_REPORT"
+        echo '      {"test": "pre_reboot_comparison", "status": "FAIL"},' >> "$JSON_REPORT"
+    fi
+    ((test_count++))
+    
+    # Test 11: DNSSEC persistence check (final test - no trailing comma)
+    echo ""
+    echo "${YELLOW}Test 11: DNSSEC Persistence After Reboot${NC}"
+    if dig +dnssec cloudflare.com | grep -q "ad;"; then
+        echo "✓ DNSSEC validation still working: PASS"
+        echo '      {"test": "dnssec_persistence", "status": "PASS"}' >> "$JSON_REPORT"
+        ((pass_count++))
+    else
+        echo "✗ DNSSEC validation failed: FAIL"
+        echo '      {"test": "dnssec_persistence", "status": "FAIL"}' >> "$JSON_REPORT"
     fi
     ((test_count++))
     

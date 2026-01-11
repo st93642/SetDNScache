@@ -263,10 +263,23 @@ main() {
     echo ""
     echo "${YELLOW}Test 7: Symlink Integrity Check${NC}"
     if check_symlinks; then
-        echo '      {"test": "symlink_integrity", "status": "PASS"}' >> "$JSON_REPORT"
+        echo '      {"test": "symlink_integrity", "status": "PASS"},' >> "$JSON_REPORT"
         ((pass_count++))
     else
-        echo '      {"test": "symlink_integrity", "status": "FAIL"}' >> "$JSON_REPORT"
+        echo '      {"test": "symlink_integrity", "status": "FAIL"},' >> "$JSON_REPORT"
+    fi
+    ((test_count++))
+    
+    # Test 8: DNSSEC validation (final test - no trailing comma)
+    echo ""
+    echo "${YELLOW}Test 8: DNSSEC Validation Check${NC}"
+    if dig +dnssec cloudflare.com | grep -q "ad;"; then
+        echo "✓ DNSSEC validation: PASS"
+        echo '      {"test": "dnssec_validation", "status": "PASS"}' >> "$JSON_REPORT"
+        ((pass_count++))
+    else
+        echo "✗ DNSSEC validation: FAIL"
+        echo '      {"test": "dnssec_validation", "status": "FAIL"}' >> "$JSON_REPORT"
     fi
     ((test_count++))
     
