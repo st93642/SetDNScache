@@ -9,7 +9,7 @@
 #                                   [--dry-run] [--yes] [--verbose] [--help]
 #
 
-set -euo pipefail
+set -Eeuo pipefail
 
 # ============================================================================
 # Configuration (paths can be overridden via environment, e.g. for testing)
@@ -140,54 +140,99 @@ confirm() {
     [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
+# Package that provides each required piece (Debian/Ubuntu/Mint names).
+# Note: dnsmasq-base ships only the binary; the "dnsmasq" package provides
+# dnsmasq.service, which this script needs.
+REQUIRED_PACKAGES=(stubby dnsmasq dnsutils iproute2)
+REQUIRED_UNITS=("$STUBBY_SERVICE" "$DNSMASQ_SERVICE")
+
+package_installed() {
+    command -v dpkg-query &>/dev/null || return 2
+    [ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true)" = "install ok installed" ]
+}
+
+unit_exists() {
+    systemctl list-unit-files --no-legend --no-pager "$1.service" 2>/dev/null | grep -q "^$1\.service" \
+        || systemctl cat "$1.service" &>/dev/null
+}
+
+missing_units() {
+    local u out=()
+    for u in "${REQUIRED_UNITS[@]}"; do
+        unit_exists "$u" || out+=("$u.service")
+    done
+    echo "${out[*]}"
+}
+
+# Install packages without letting the package scripts start the daemons
+# (dnsmasq would start with the stock config and fight over port 53).
+install_packages() {
+    local policy=/usr/sbin/policy-rc.d created_policy=false rc=0
+    if [ ! -e "$policy" ]; then
+        printf '#!/bin/sh\nexit 101\n' > "$policy"
+        chmod 755 "$policy"
+        created_policy=true
+    fi
+    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" || rc=$?
+    if [ "$created_policy" = true ]; then
+        rm -f "$policy"
+    fi
+    # In case a daemon was started anyway, stop it until it is configured.
+    systemctl stop "$DNSMASQ_SERVICE" 2>/dev/null || true
+    return "$rc"
+}
+
 check_dependencies() {
     log INFO "Checking required dependencies..."
 
-    local missing_cmds=() packages=()
-    local cmd
-    for cmd in stubby dnsmasq dig systemctl; do
-        if ! command -v "$cmd" &> /dev/null; then
-            missing_cmds+=("$cmd")
-            case "$cmd" in
-                stubby)  packages+=("stubby") ;;
-                dnsmasq) packages+=("dnsmasq") ;;
-                dig)     packages+=("dnsutils") ;;
-                systemctl) ;;  # not installable here
-            esac
+    local packages=() pkg
+    if command -v dpkg-query &>/dev/null; then
+        for pkg in "${REQUIRED_PACKAGES[@]}"; do
+            package_installed "$pkg" || packages+=("$pkg")
+        done
+    else
+        command -v stubby &>/dev/null || packages+=("stubby")
+        command -v dnsmasq &>/dev/null || packages+=("dnsmasq")
+        command -v dig &>/dev/null || packages+=("dnsutils")
+        command -v ss &>/dev/null || command -v netstat &>/dev/null || packages+=("iproute2")
+    fi
+
+    if ! command -v systemctl &>/dev/null; then
+        log ERROR "systemd (systemctl) is required"
+        return 1
+    fi
+
+    if [ ${#packages[@]} -gt 0 ]; then
+        log WARN "Missing packages: ${packages[*]}"
+        if ! command -v apt-get &>/dev/null; then
+            log ERROR "apt-get not found. Please install manually: ${packages[*]}"
+            return 1
         fi
-    done
-    if ! command -v ss &>/dev/null && ! command -v netstat &>/dev/null; then
-        missing_cmds+=("ss/netstat")
-        packages+=("iproute2")
+        if [ "$DRY_RUN" = true ]; then
+            log INFO "[DRY RUN] would run: apt-get install -y ${packages[*]} (with service autostart blocked)"
+            return 0
+        fi
+        if ! confirm "Install missing packages (${packages[*]}) with apt-get?"; then
+            log ERROR "Dependencies missing. Install manually: sudo apt-get install ${packages[*]}"
+            return 1
+        fi
+        if ! install_packages "${packages[@]}"; then
+            log ERROR "Failed to install dependencies (see apt output above)."
+            return 1
+        fi
+        log INFO "Installed: ${packages[*]}"
     fi
 
-    if [ ${#missing_cmds[@]} -eq 0 ]; then
-        log INFO "All dependencies satisfied"
-        return 0
+    local units
+    units=$(missing_units)
+    if [ -n "$units" ]; then
+        log ERROR "Required systemd unit(s) not found: $units"
+        log INFO "On Debian/Ubuntu/Mint install the full packages: sudo apt-get install stubby dnsmasq"
+        log INFO "(dnsmasq-base alone has no dnsmasq.service)"
+        return 1
     fi
 
-    log WARN "Missing commands: ${missing_cmds[*]}"
-    if [ ${#packages[@]} -eq 0 ]; then
-        log ERROR "systemd is required and cannot be installed by this script"
-        return 1
-    fi
-    if ! command -v apt-get &>/dev/null; then
-        log ERROR "apt-get not found. Please install manually: ${packages[*]}"
-        return 1
-    fi
-    if [ "$DRY_RUN" = true ]; then
-        log INFO "[DRY RUN] would run: apt-get install -y ${packages[*]}"
-        return 0
-    fi
-    if ! confirm "Install missing packages (${packages[*]}) with apt-get?"; then
-        log ERROR "Dependencies missing. Install manually: apt-get install ${packages[*]}"
-        return 1
-    fi
-    if ! { apt-get update -qq && apt-get install -y "${packages[@]}"; }; then
-        log ERROR "Failed to install dependencies (see apt output above)."
-        return 1
-    fi
-    log INFO "Dependencies installed"
+    log INFO "All dependencies satisfied"
 }
 
 # ============================================================================
@@ -350,11 +395,14 @@ enable_and_restart_services() {
     log INFO "Enabling and (re)starting services..."
     record_service_state "$STUBBY_SERVICE"
     record_service_state "$DNSMASQ_SERVICE"
-    run systemctl enable "$STUBBY_SERVICE"
-    run systemctl restart "$STUBBY_SERVICE"
-    [ "$DRY_RUN" = true ] || sleep 2
-    run systemctl enable "$DNSMASQ_SERVICE"
-    run systemctl restart "$DNSMASQ_SERVICE"
+    # Explicit && chain: this function is called from an "if", where set -e
+    # is suspended. Stubby goes first so it releases 127.0.0.1:53 (the
+    # package default) before dnsmasq binds it.
+    run systemctl enable "$STUBBY_SERVICE" &&
+        run systemctl restart "$STUBBY_SERVICE" &&
+        { [ "$DRY_RUN" = true ] || sleep 2; } &&
+        run systemctl enable "$DNSMASQ_SERVICE" &&
+        run systemctl restart "$DNSMASQ_SERVICE"
 }
 
 local_resolver_works() {
@@ -860,6 +908,7 @@ configure_secure_dns() {
         mkdir -p "$STATE_DIR"
         chmod 700 "$STATE_DIR"
         state_add "run=$(date '+%Y-%m-%d %H:%M:%S')"
+        trap 'rc=$?; log ERROR "Setup failed (exit $rc). Changes so far are recorded in $STATE_FILE; undo with: sudo $0 --rollback"' ERR
     fi
 
     log_section "Configuring Stubby with DNS-over-TLS"
@@ -871,7 +920,11 @@ configure_secure_dns() {
     generate_dnsmasq_config
 
     log_section "Starting Services"
-    enable_and_restart_services
+    if ! enable_and_restart_services; then
+        log ERROR "Starting services failed. Inspect: journalctl -u stubby -u dnsmasq"
+        log INFO "Changes so far are recorded in $STATE_FILE; undo with: sudo $0 --rollback"
+        exit 1
+    fi
 
     # Only switch the system resolver once the new chain answers, so a failure
     # here never leaves the machine without DNS.

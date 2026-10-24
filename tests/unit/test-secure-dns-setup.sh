@@ -124,5 +124,47 @@ out=$(bash -c "source '$SCRIPT'; DRY_RUN=true; backup_config '$TMP/f'" 2>&1)
 check "dry-run backup logs no 'Backed up'" '! grep -q "Backed up" <<< "$out" && grep -q "would run: cp" <<< "$out"'
 check "dry-run left no backup file" '! ls "$TMP"/f.bak.* >/dev/null 2>&1'
 
+# 10. Dependencies: dnsmasq-base only, missing units, start failure keeps state
+cat > "$TMP/bin/dpkg-query" <<'FAKE'
+#!/bin/bash
+pkg="${!#}"
+case " $MISSING_PKGS " in *" $pkg "*) echo -n "unknown ok not-installed" ;; *) echo -n "install ok installed" ;; esac
+FAKE
+cat > "$TMP/bin/systemctl" <<'FAKE'
+#!/bin/bash
+echo "$*" >> "$SYSTEMCTL_LOG"
+case "$1" in
+  list-unit-files) u="${*: -1}"; case " $MISSING_UNITS " in *" ${u%.service} "*) exit 1;; *) echo "$u enabled enabled";; esac ;;
+  cat) case " $MISSING_UNITS " in *" ${2%.service} "*) exit 1;; esac ;;
+  is-enabled) echo disabled; exit 1 ;;
+  is-active) echo inactive; exit 3 ;;
+  enable|restart) case " $FAIL_START " in *" $2 "*) echo "Failed to $1 $2" >&2; exit 1;; esac ;;
+esac
+exit 0
+FAKE
+chmod +x "$TMP/bin/dpkg-query" "$TMP/bin/systemctl"
+export MISSING_PKGS="" MISSING_UNITS="" FAIL_START=""
+
+out=$(MISSING_PKGS="dnsmasq" bash -c "source '$SCRIPT'; DRY_RUN=true; check_dependencies" 2>&1)
+check "dnsmasq-base only: dnsmasq package reported missing" 'grep -q "Missing packages: dnsmasq" <<< "$out"'
+check "dry-run shows apt-get install dnsmasq" 'grep -q "would run: apt-get install -y dnsmasq" <<< "$out"'
+
+out=$(MISSING_UNITS="dnsmasq" bash -c "source '$SCRIPT'; check_dependencies" 2>&1 || echo "RC=$?")
+check "missing dnsmasq.service is fatal" 'grep -q "unit(s) not found: dnsmasq.service" <<< "$out" && grep -q "RC=1" <<< "$out"'
+
+rm -rf "${TMP:?}/etc" "${TMP:?}/state"
+out=$(MISSING_PKGS="dnsmasq" bash -c "source '$SCRIPT'; check_root() { :; }; test_connectivity() { return 0; }; configure_secure_dns" 2>&1 </dev/null || echo "RC=$?")
+check "declined install fails before writing config" 'grep -q "RC=" <<< "$out" && [ ! -e "$STUBBY_CONFIG" ] && [ ! -e "$DNSMASQ_D/stubby-forward.conf" ]'
+
+rm -rf "${TMP:?}/etc" "${TMP:?}/state"; mkdir -p "$TMP/etc/stubby"; echo original > "$STUBBY_CONFIG"
+out=$(FAIL_START="dnsmasq" bash -c "source '$SCRIPT'; check_root() { :; }; test_connectivity() { return 0; }; configure_secure_dns" 2>&1 || echo "RC=$?")
+check "service start failure exits non-zero" 'grep -q "RC=1" <<< "$out"'
+check "failure message points to --rollback" 'grep -q -- "--rollback" <<< "$out"'
+check "state records stubby backup after failure" 'grep -q "^backup=$STUBBY_CONFIG|" "$STATE_DIR/state"'
+check "state records created dnsmasq drop-in" 'grep -q "^created=$DNSMASQ_D/stubby-forward.conf" "$STATE_DIR/state"'
+check "state records original service states" 'grep -q "^service=dnsmasq|" "$STATE_DIR/state"'
+bash -c "source '$SCRIPT'; check_root() { :; }; rollback" >/dev/null 2>&1
+check "rollback after failed run restores stubby config" '[ "$(cat "$STUBBY_CONFIG")" = original ] && [ ! -e "$DNSMASQ_D/stubby-forward.conf" ]'
+
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
