@@ -11,8 +11,8 @@ SetDNScache provides secure DNS over TLS with local caching for enhanced privacy
 > - Upstreams are authenticated by **certificate name** (`tls_auth_name`) only; the
 >   placeholder SPKI pins were removed (stale pins make Stubby reject servers).
 > - **systemd-resolved is not stopped or disabled.** The script installs
->   `/etc/systemd/resolved.conf.d/setdnscache.conf` (`DNS=127.0.0.1`, `DNSStubListener=no`),
->   repoints `/etc/resolv.conf` to `/run/systemd/resolve/resolv.conf` if it used the stub,
+>   `/etc/systemd/resolved.conf.d/setdnscache.conf` (`DNS=127.0.0.1`, `Domains=~.`, stub on 127.0.0.53 kept),
+>   links `/etc/resolv.conf` to `stub-resolv.conf` (only 127.0.0.53) and sets `ipv4/ipv6.ignore-auto-dns=yes` on NetworkManager ethernet/Wi-Fi connections so DHCP/RA DNS servers cannot bypass Stubby (VPN connections untouched; all recorded for `--rollback`),
 >   and only does so after dnsmasq/Stubby answer on 127.0.0.1.
 > - dnsmasq uses `proxy-dnssec` (upstream validates DNSSEC) and honours `/etc/hosts`.
 > - `--dry-run` really changes nothing and works without root; `--yes` skips the
