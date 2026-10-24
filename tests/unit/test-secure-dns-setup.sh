@@ -34,7 +34,7 @@ out=$(bash -c "set -euo pipefail; source '$SCRIPT'
   test_dns_resolution() { return 1; }; test_port_connectivity() { return 1; }
   test_service_status() { return 0; }; test_dnssec_validation() { return 0; }
   test_latency() { return 0; }; test_fallback_servers() { return 0; }
-  test_conflict_detection() { return 0; }
+  test_conflict_detection() { return 0; }; test_dns_leak() { return 0; }
   rc=0; test_connectivity unit >/dev/null || rc=\$?; echo \"rc=\$rc\"")
 check "test_connectivity counts failures and does not abort" '[ "$out" = "rc=2" ]'
 
@@ -137,7 +137,7 @@ case "$1" in
   list-unit-files) u="${*: -1}"; case " $MISSING_UNITS " in *" ${u%.service} "*) exit 1;; *) echo "$u enabled enabled";; esac ;;
   cat) case " $MISSING_UNITS " in *" ${2%.service} "*) exit 1;; esac ;;
   is-enabled) echo disabled; exit 1 ;;
-  is-active) echo inactive; exit 3 ;;
+  is-active) case " ${ACTIVE_SVCS:-} " in *" $2 "*) echo active; exit 0;; esac; echo inactive; exit 3 ;;
   enable|restart) case " $FAIL_START " in *" $2 "*) echo "Failed to $1 $2" >&2; exit 1;; esac ;;
 esac
 exit 0
@@ -202,6 +202,87 @@ check "start failure: resolver untouched + rollback hint" '! grep -q RESOLVER_TO
 echo "conf-dir=/etc/dnsmasq.d/,*.conf" > "$DNSMASQ_CONF"; : > "$TMP_DNSMASQ_LOG"
 bash -c 'source "'"$SCRIPT"'"; dnsmasq_config_test' >/dev/null 2>&1
 check "no duplicate conf-dir when dnsmasq.conf has one" '! grep -q -- "--conf-dir" "$TMP_DNSMASQ_LOG"'
+
+# 12. DNS leak fix: stub resolv.conf, NM ignore-auto-dns, idempotent rerun, rollback
+cat > "$TMP/bin/nmcli" <<'FAKE'
+#!/bin/bash
+db="$NM_DB"; echo "$*" >> "$NM_LOG"
+case "$*" in
+  "-t general status") exit 0 ;;
+  "-t -f UUID,TYPE,NAME connection show") cat "$db/list" ;;
+  "-g ipv4.ignore-auto-dns,ipv6.ignore-auto-dns connection show "*) u="${*: -1}"; cat "$db/$u.v4" "$db/$u.v6" ;;
+  "-g ipv4.dns,ipv6.dns connection show "*) echo; echo ;;
+  "-g GENERAL.DEVICES connection show "*) echo eth0 ;;
+  "connection modify "*) u="$3"; echo "$5" > "$db/$u.v4"; echo "$7" > "$db/$u.v6" ;;
+  "device reapply "*) ;;
+esac
+FAKE
+cat > "$TMP/bin/resolvectl" <<'FAKE'
+#!/bin/bash
+case "$1" in status) exit 0;; dns) cat "$RESOLVECTL_DNS";; esac
+FAKE
+chmod +x "$TMP/bin/nmcli" "$TMP/bin/resolvectl"
+export ACTIVE_SVCS=systemd-resolved NM_DB="$TMP/nm" NM_LOG="$TMP/nm.log" RESOLVECTL_DNS="$TMP/rdns" RESOLV_CONF="$TMP/etc/resolv.conf" RESOLVED_STUB_RESOLV="$TMP/run/stub-resolv.conf"
+reset_nm() {
+  rm -rf "$NM_DB"; mkdir -p "$NM_DB"; : > "$NM_LOG"
+  printf 'u-eth:802-3-ethernet:Wired 1\nu-vpn:wireguard:wg0\nu-wifi:802-11-wireless:Home\n' > "$NM_DB/list"
+  for u in u-eth u-vpn; do echo no > "$NM_DB/$u.v4"; echo no > "$NM_DB/$u.v6"; done
+  echo yes > "$NM_DB/u-wifi.v4"; echo no > "$NM_DB/u-wifi.v6"
+}
+setup_tree() {
+  rm -rf "${TMP:?}/etc" "${TMP:?}/state" "${TMP:?}/run"; mkdir -p "$TMP/etc/stubby" "$TMP/run"
+  echo original > "$STUBBY_CONFIG"; echo "nameserver 127.0.0.53" > "$RESOLVED_STUB_RESOLV"
+  echo "nameserver 192.168.8.1" > "$TMP/run/resolv.conf"; ln -s "$TMP/run/resolv.conf" "$RESOLV_CONF"
+}
+RUN2='source "'"$SCRIPT"'"; check_root() { :; }; test_connectivity() { return 0; }; local_resolver_works() { return 0; }; configure_secure_dns'
+reset_nm; setup_tree; : > "$SYSTEMCTL_LOG"
+bash -c "$RUN2" >/dev/null 2>&1 || true
+check "resolved drop-in keeps stub, DNS=127.0.0.1 Domains=~." 'f="$RESOLVED_DROPIN_DIR/setdnscache.conf"; grep -qx "DNS=127.0.0.1" "$f" && grep -qx "Domains=~." "$f" && ! grep -q DNSStubListener "$f"'
+check "resolv.conf -> stub-resolv.conf" '[ "$(readlink "$RESOLV_CONF")" = "$RESOLVED_STUB_RESOLV" ]'
+check "ethernet ignores DHCP DNS v4+v6" '[ "$(cat "$NM_DB/u-eth.v4")$(cat "$NM_DB/u-eth.v6")" = yesyes ]'
+check "wifi partially set gets v6 too" '[ "$(cat "$NM_DB/u-wifi.v6")" = yes ]'
+check "VPN connection untouched" '[ "$(cat "$NM_DB/u-vpn.v4")" = no ] && ! grep -q "modify u-vpn" "$NM_LOG"'
+check "NM originals recorded in state" 'grep -qx "nm=u-eth|no|no" "$STATE_DIR/state" && grep -qx "nm=u-wifi|yes|no" "$STATE_DIR/state"'
+check "device reapplied" 'grep -q "device reapply eth0" "$NM_LOG"'
+nb=$(find "$STATE_DIR/backups" -type f -o -type l | wc -l); ns=$(wc -l < "$STATE_DIR/state")
+: > "$NM_LOG"; sleep 1
+bash -c "$RUN2" >/dev/null 2>&1 || true
+check "rerun: no new backups" '[ "$(find "$STATE_DIR/backups" -type f -o -type l | wc -l)" = "$nb" ]'
+check "rerun: no new backup/created/nm records" '[ "$(grep -cE "^(backup|created|nm)=" "$STATE_DIR/state")" = "$(head -n "$ns" "$STATE_DIR/state" | grep -cE "^(backup|created|nm)=")" ]'
+check "rerun: NM not modified again" '! grep -q "connection modify" "$NM_LOG"'
+bash -c 'source "'"$SCRIPT"'"; check_root() { :; }; rollback' >/dev/null 2>&1
+check "rollback restores NM settings" '[ "$(cat "$NM_DB/u-eth.v4")$(cat "$NM_DB/u-eth.v6")" = nono ] && [ "$(cat "$NM_DB/u-wifi.v4")$(cat "$NM_DB/u-wifi.v6")" = yesno ]'
+check "rollback restores resolv.conf symlink" '[ "$(readlink "$RESOLV_CONF")" = "$TMP/run/resolv.conf" ] && [ "$(cat "$STUBBY_CONFIG")" = original ]'
+
+reset_nm; setup_tree; rm -rf "${TMP:?}/state"
+out=$(bash -c 'source "'"$SCRIPT"'"; DRY_RUN=true; configure_system_resolver' 2>&1)
+check "dry-run shows leak fix plan" 'grep -q "would run: ln -sfn $RESOLVED_STUB_RESOLV" <<< "$out" && grep -q "would run: nmcli connection modify u-eth ipv4.ignore-auto-dns yes" <<< "$out"'
+check "dry-run changes nothing" '[ "$(cat "$NM_DB/u-eth.v4")" = no ] && [ ! -e "$STATE_DIR/state" ] && [ "$(readlink "$RESOLV_CONF")" = "$TMP/run/resolv.conf" ]'
+
+# leak test
+printf 'Global: 127.0.0.1\nLink 2 (enp1s0): fe80::1%%2 192.168.8.1\nLink 3 (wlp2s0):\n' > "$RESOLVECTL_DNS"
+printf 'nameserver 127.0.0.1\nnameserver 192.168.8.1\n' > "$TMP/leak.conf"
+out=$(RESOLV_CONF="$TMP/leak.conf" bash -c 'source "'"$SCRIPT"'"; test_dns_leak' 2>&1 || echo RC=1)
+check "leak test flags DHCP servers" 'grep -q "RC=1" <<< "$out" && grep -q "192.168.8.1" <<< "$out" && grep -q "fe80::1%2" <<< "$out"'
+printf 'Global: 127.0.0.1\nLink 2 (enp1s0):\n' > "$RESOLVECTL_DNS"; echo "nameserver 127.0.0.53" > "$TMP/leak.conf"
+check "leak test passes when only local" 'RESOLV_CONF="$TMP/leak.conf" bash -c '"'"'source "'"$SCRIPT"'"; test_dns_leak'"'"' >/dev/null 2>&1'
+
+# DNSSEC test with fake dig
+mkdir -p "$TMP/digbin"; cat > "$TMP/digbin/dig" <<'FAKE'
+#!/bin/bash
+q=""; for a in "$@"; do case "$a" in *.com|*.org) q="$a";; esac; done
+case "$q" in
+  dnssec-failed.org) st="${BOGUS_STATUS:-SERVFAIL}"; fl="qr rd ra" ;;
+  *) st=NOERROR; fl="qr rd ra${AD_FLAG- ad}" ;;
+esac
+echo ";; ->>HEADER<<- opcode: QUERY, status: $st, id: 1"
+echo ";; flags: $fl; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1"
+FAKE
+chmod +x "$TMP/digbin/dig"
+dt() { PATH="$TMP/digbin:$PATH" bash -c 'source "'"$SCRIPT"'"; test_dnssec_validation' >/dev/null 2>&1; }
+check "DNSSEC passes: AD set + bogus SERVFAIL" 'dt'
+check "DNSSEC fails without AD flag" '! AD_FLAG="" dt'
+check "DNSSEC fails when bogus domain resolves" '! BOGUS_STATUS=NOERROR dt'
 
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
