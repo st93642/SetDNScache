@@ -3,7 +3,7 @@
 ## Project Overview
 
 SetDNScache is a Bash-based DNS security solution implementing DNS-over-TLS with local caching. The system configures two key services:
-- **Stubby** (port 5353): Handles DNS-over-TLS queries to upstream providers (Cloudflare primary, Quad9 secondary, Google tertiary)
+- **Stubby** (port 5453): Handles DNS-over-TLS queries to upstream providers (Cloudflare primary, Quad9 secondary, Google tertiary)
 - **DNSMasq** (port 53): Provides local DNS caching and DNSSEC validation, forwards queries through Stubby
 
 ## Architecture Essentials
@@ -66,7 +66,7 @@ sudo ./secure-dns-setup.sh  # Main setup: check deps → backup configs → writ
 - Status checks use `systemctl is-active` and `systemctl is-enabled`
 
 **Network Validation**:
-- Port listening checks via `ss -tuln` (Stubby:5353, DNSMasq:53)
+- Port listening checks via `ss -tuln` (Stubby:5453, DNSMasq:53)
 - DNS queries via `dig` and `nslookup`
 - TLS connectivity validation to upstream providers
 
@@ -95,7 +95,7 @@ sudo ./secure-dns-setup.sh  # Main setup: check deps → backup configs → writ
   1. Stubby service verification
   2. DNSMasq service verification
   3. Port 53 listening check
-  4. Port 5353 listening check
+  4. Port 5453 listening check
   5. Configuration files verification
   6. DNS resolution test (example.com, google.com, cloudflare.com)
   7. Symlink integrity check

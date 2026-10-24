@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 #Requires -RunAsAdministrator
 
 <#
@@ -54,7 +54,7 @@ $Script:Config = @{
     JsonReport = "$env:TEMP\SetDNScache\test-results\test-results.json"
     
     TestDomains = @("example.com", "google.com", "cloudflare.com", "github.com")
-    ExpectedDnsServers = @("1.1.1.1", "1.0.0.1", "9.9.9.9", "149.112.112.112", "8.8.8.8", "8.8.4.4")
+    ExpectedDnsServers = @("1.1.1.1", "9.9.9.9", "1.0.0.1", "149.112.112.112")
 }
 
 # ============================================================================

@@ -1,12 +1,23 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Configure Ethernet adapter with secure DNS servers
+    Configure a network adapter (default: Ethernet) with secure DNS servers
 
 .DESCRIPTION
     Sets up Ethernet adapter with the same secure DNS configuration as Wi-Fi
-    Uses Cloudflare, Quad9, and Google DNS servers with DoH encryption
+    Uses Cloudflare and Quad9 DNS servers (DoH is configured by Secure-DnsSetup.ps1)
+
+.PARAMETER InterfaceAlias
+    Adapter name to configure (default "Ethernet"). See Get-NetAdapter.
+
+.PARAMETER NoPause
+    Do not wait for a key press at the end (for non-interactive use).
 #>
+[CmdletBinding()]
+param(
+    [string]$InterfaceAlias = "Ethernet",
+    [switch]$NoPause
+)
 
 Write-Host ""
 Write-Host "============================================================================" -ForegroundColor Cyan
@@ -15,11 +26,11 @@ Write-Host "====================================================================
 Write-Host ""
 
 # DNS servers (same as Wi-Fi configuration)
-$dnsServers = @("1.1.1.1", "1.0.0.1", "9.9.9.9", "149.112.112.112", "8.8.8.8", "8.8.4.4")
+$dnsServers = @("1.1.1.1", "9.9.9.9", "1.0.0.1", "149.112.112.112")
 
 try {
     # Check if Ethernet adapter exists and is available
-    $ethernet = Get-NetAdapter -Name "Ethernet" -ErrorAction Stop
+    $ethernet = Get-NetAdapter -Name $InterfaceAlias -ErrorAction Stop
     
     if ($ethernet.Status -eq 'Up') {
         Write-Host "✓ Ethernet adapter is connected" -ForegroundColor Green
@@ -30,7 +41,7 @@ try {
     
     Write-Host ""
     Write-Host "Current Ethernet DNS servers:" -ForegroundColor Yellow
-    $currentDns = (Get-DnsClientServerAddress -InterfaceAlias "Ethernet" -AddressFamily IPv4).ServerAddresses
+    $currentDns = (Get-DnsClientServerAddress -InterfaceAlias $InterfaceAlias -AddressFamily IPv4).ServerAddresses
     if ($currentDns) {
         $currentDns | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
     } else {
@@ -41,20 +52,18 @@ try {
     Write-Host "Configuring secure DNS servers..." -ForegroundColor Cyan
     
     # Set DNS servers
-    Set-DnsClientServerAddress -InterfaceAlias "Ethernet" -ServerAddresses $dnsServers
+    Set-DnsClientServerAddress -InterfaceAlias $InterfaceAlias -ServerAddresses $dnsServers
     
     Write-Host "✓ DNS servers configured successfully!" -ForegroundColor Green
     
     Write-Host ""
     Write-Host "New Ethernet DNS configuration:" -ForegroundColor Yellow
-    $newDns = (Get-DnsClientServerAddress -InterfaceAlias "Ethernet" -AddressFamily IPv4).ServerAddresses
+    $newDns = (Get-DnsClientServerAddress -InterfaceAlias $InterfaceAlias -AddressFamily IPv4).ServerAddresses
     $newDns | ForEach-Object { Write-Host "  $_" -ForegroundColor Green }
     
     Write-Host ""
     Write-Host "DNS Hierarchy:" -ForegroundColor Cyan
-    Write-Host "  Primary:   Cloudflare (1.1.1.1, 1.0.0.1)" -ForegroundColor White
-    Write-Host "  Secondary: Quad9 (9.9.9.9, 149.112.112.112)" -ForegroundColor White
-    Write-Host "  Tertiary:  Google (8.8.8.8, 8.8.4.4)" -ForegroundColor White
+    Write-Host "  Cloudflare (1.1.1.1, 1.0.0.1) and Quad9 (9.9.9.9, 149.112.112.112), interleaved" -ForegroundColor White
     
     Write-Host ""
     Write-Host "✓ DoH (DNS-over-HTTPS) encryption is already configured for these servers" -ForegroundColor Green
@@ -89,8 +98,8 @@ try {
     Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host ""
     
-    if ($_.Exception.Message -like "*Cannot find a parameter*Ethernet*") {
-        Write-Host "Your Ethernet adapter might have a different name." -ForegroundColor Yellow
+    if (-not (Get-NetAdapter -Name $InterfaceAlias -ErrorAction SilentlyContinue)) {
+        Write-Host "No adapter named '$InterfaceAlias'. Re-run with -InterfaceAlias <name>." -ForegroundColor Yellow
         Write-Host "Available network adapters:" -ForegroundColor Yellow
         Get-NetAdapter | Where-Object { $_.Status -ne 'Disabled' } | ForEach-Object {
             Write-Host "  - $($_.Name) ($($_.Status))" -ForegroundColor Cyan
@@ -98,5 +107,7 @@ try {
     }
 }
 
-Write-Host "Press any key to close..." -ForegroundColor Gray
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+if (-not $NoPause) {
+    Write-Host "Press any key to close..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}

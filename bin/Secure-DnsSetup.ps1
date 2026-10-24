@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 #Requires -RunAsAdministrator
 
 <#
@@ -21,6 +21,10 @@
 
 .PARAMETER DryRun
     Show what would be done without making changes
+
+.PARAMETER InterfaceAlias
+    Name(s) of the network adapter(s) to configure, e.g. "Wi-Fi","Ethernet 2".
+    Default: every adapter that is currently Up.
 
 .EXAMPLE
     .\Secure-DnsSetup.ps1
@@ -52,7 +56,10 @@ param(
     [switch]$DryRun,
     
     [Parameter(Mandatory=$false)]
-    [switch]$VerboseLogging
+    [switch]$VerboseLogging,
+
+    [Parameter(Mandatory=$false)]
+    [string[]]$InterfaceAlias
 )
 
 # ============================================================================
@@ -73,6 +80,10 @@ $Script:Config = @{
     GoogleDoH = "https://dns.google/dns-query"
     GoogleTemplate = "https://dns.google/dns-query{?dns}"
     
+    # Servers set on each adapter. Windows only uses a handful of entries,
+    # so keep 4, interleaving providers for failover diversity.
+    AdapterServers = @("1.1.1.1", "9.9.9.9", "1.0.0.1", "149.112.112.112")
+
     # Logging
     LogPath = "$env:TEMP\SetDNScache"
     LogFile = "$env:TEMP\SetDNScache\dns-setup.log"
@@ -178,17 +189,16 @@ function Test-NetworkConnectivity {
     
     $testHosts = @(
         @{Name = "Cloudflare"; IP = "1.1.1.1"},
-        @{Name = "Quad9"; IP = "9.9.9.9"},
-        @{Name = "Google"; IP = "8.8.8.8"}
+        @{Name = "Quad9"; IP = "9.9.9.9"}
     )
     
     $allPassed = $true
-    foreach ($host in $testHosts) {
-        $result = Test-Connection -ComputerName $host.IP -Count 2 -Quiet -ErrorAction SilentlyContinue
+    foreach ($target in $testHosts) {
+        $result = Test-Connection -ComputerName $target.IP -Count 2 -Quiet -ErrorAction SilentlyContinue
         if ($result) {
-            Write-Log -Level DEBUG -Message "✓ $($host.Name) ($($host.IP)) - Reachable"
+            Write-Log -Level DEBUG -Message "✓ $($target.Name) ($($target.IP)) - Reachable"
         } else {
-            Write-Log -Level WARN -Message "✗ $($host.Name) ($($host.IP)) - Not reachable"
+            Write-Log -Level WARN -Message "✗ $($target.Name) ($($target.IP)) - Not reachable"
             $allPassed = $false
         }
     }
@@ -202,6 +212,24 @@ function Test-NetworkConnectivity {
     
     return $allPassed
 }
+
+function Get-TargetAdapters {
+    if ($InterfaceAlias -and $InterfaceAlias.Count -gt 0) {
+        $found = @()
+        foreach ($alias in $InterfaceAlias) {
+            $a = Get-NetAdapter -Name $alias -ErrorAction SilentlyContinue
+            if ($a) { $found += $a }
+            else {
+                Write-Log -Level ERROR -Message "Adapter '$alias' not found. Available: $((Get-NetAdapter | Select-Object -ExpandProperty Name) -join ', ')"
+            }
+        }
+        return ,$found
+    }
+    return ,@(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' })
+}
+
+# Script-scoped list of DoH server entries this run created (for rollback)
+$Script:AddedDohServers = @()
 
 # ============================================================================
 # Backup and Restore Functions
@@ -217,11 +245,11 @@ function Backup-DnsConfiguration {
         Timestamp = $timestamp
         Adapters = @()
         DnsCache = @{}
-        DoHSettings = @{}
+        AddedDohServers = @()
     }
     
     # Backup network adapter DNS settings
-    $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+    $adapters = Get-TargetAdapters
     foreach ($adapter in $adapters) {
         $dnsServers = Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
         
@@ -248,6 +276,11 @@ function Backup-DnsConfiguration {
         Write-Log -Level DEBUG -Message "No existing DNS cache settings to backup"
     }
     
+    if ($DryRun) {
+        Write-Log -Level INFO -Message "[DRY RUN] Would write backup to: $backupFile"
+        return $backupFile
+    }
+
     # Save backup to file
     $backup | ConvertTo-Json -Depth 10 | Set-Content -Path $backupFile
     
@@ -286,16 +319,20 @@ function Restore-DnsConfiguration {
             }
         }
         
-        # Disable DoH
-        Write-Log -Level INFO -Message "Disabling DNS-over-HTTPS..."
-        try {
-            # Remove DoH configuration via netsh
-            $dohServers = @("1.1.1.1", "1.0.0.1", "9.9.9.9", "149.112.112.112", "8.8.8.8", "8.8.4.4")
-            foreach ($server in $dohServers) {
-                netsh dns delete encryption server=$server | Out-Null
+        # Remove only the DoH entries this script added. Windows ships built-in
+        # DoH entries for these well-known resolvers; those are left alone.
+        $added = @($backup.AddedDohServers)
+        if ($added.Count -eq 0) {
+            Write-Log -Level INFO -Message "No DoH entries were added by SetDNScache; leaving DoH table unchanged"
+        }
+        foreach ($server in $added) {
+            if (-not $server) { continue }
+            try {
+                Remove-DnsClientDohServerAddress -ServerAddress $server -ErrorAction Stop
+                Write-Log -Level INFO -Message "Removed DoH entry added by SetDNScache: $server"
+            } catch {
+                Write-Log -Level WARN -Message "Could not remove DoH entry $server`: $($_.Exception.Message)"
             }
-        } catch {
-            Write-Log -Level DEBUG -Message "DoH removal: $($_.Exception.Message)"
         }
         
         # Clear DNS cache
@@ -317,15 +354,14 @@ function Restore-DnsConfiguration {
 function Set-SecureDnsServers {
     Write-Log -Level INFO -Message "Configuring DNS servers..."
     
-    $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+    $adapters = Get-TargetAdapters
     
     if ($adapters.Count -eq 0) {
-        Write-Log -Level ERROR -Message "No active network adapters found"
+        Write-Log -Level ERROR -Message "No matching network adapters found"
         return $false
     }
     
-    # All DNS servers (Primary, Secondary, Tertiary)
-    $allDnsServers = $Script:Config.CloudflarePrimary + $Script:Config.Quad9Secondary + $Script:Config.GoogleTertiary
+    $allDnsServers = $Script:Config.AdapterServers
     
     foreach ($adapter in $adapters) {
         Write-Log -Level INFO -Message "Configuring adapter: $($adapter.Name)"
@@ -350,14 +386,8 @@ function Enable-DnsOverHttps {
     
     $dohConfigs = @(
         @{
-            Name = "Cloudflare Primary"
+            Name = "Cloudflare"
             Servers = $Script:Config.CloudflarePrimary
-            Template = $Script:Config.CloudflareTemplate
-            Fallback = $false
-        },
-        @{
-            Name = "Cloudflare Secondary"
-            Servers = @("1.0.0.1")
             Template = $Script:Config.CloudflareTemplate
             Fallback = $false
         },
@@ -366,12 +396,6 @@ function Enable-DnsOverHttps {
             Servers = $Script:Config.Quad9Secondary
             Template = $Script:Config.Quad9Template
             Fallback = $false
-        },
-        @{
-            Name = "Google"
-            Servers = $Script:Config.GoogleTertiary
-            Template = $Script:Config.GoogleTemplate
-            Fallback = $true
         }
     )
     
@@ -381,13 +405,15 @@ function Enable-DnsOverHttps {
                 Write-Log -Level INFO -Message "[DRY RUN] Would enable DoH for $($config.Name): $server"
             } else {
                 try {
-                    # Windows 11 DoH configuration via netsh
-                    $result = netsh dns add encryption server=$server dohtemplate=$($config.Template) autoupgrade=yes 2>&1
-                    
-                    if ($LASTEXITCODE -eq 0) {
-                        Write-Log -Level SUCCESS -Message "✓ DoH enabled for $($config.Name): $server"
+                    $existing = Get-DnsClientDohServerAddress -ServerAddress $server -ErrorAction SilentlyContinue
+                    if ($existing) {
+                        # Built-in or pre-existing entry: update in place, do not record as ours
+                        Set-DnsClientDohServerAddress -ServerAddress $server -DohTemplate $config.Template -AutoUpgrade $true -AllowFallbackToUdp $config.Fallback -ErrorAction Stop | Out-Null
+                        Write-Log -Level SUCCESS -Message "✓ DoH entry already existed, enabled auto-upgrade for $($config.Name): $server"
                     } else {
-                        Write-Log -Level WARN -Message "DoH configuration warning for $server`: $result"
+                        Add-DnsClientDohServerAddress -ServerAddress $server -DohTemplate $config.Template -AutoUpgrade $true -AllowFallbackToUdp $config.Fallback -ErrorAction Stop | Out-Null
+                        $Script:AddedDohServers += $server
+                        Write-Log -Level SUCCESS -Message "✓ DoH entry added for $($config.Name): $server"
                     }
                 } catch {
                     Write-Log -Level WARN -Message "DoH configuration failed for $server`: $($_.Exception.Message)"
@@ -431,24 +457,12 @@ function Optimize-DnsCache {
 }
 
 function Enable-DnsSecurity {
-    Write-Log -Level INFO -Message "Enabling DNS security features..."
-    
-    if ($DryRun) {
-        Write-Log -Level INFO -Message "[DRY RUN] Would enable DNSSEC validation"
-    } else {
-        try {
-            # Enable DNSSEC validation
-            Set-DnsClientNrptGlobal -EnableDAForAllNetworks $true -ErrorAction SilentlyContinue
-            
-            # Set DNS query privacy
-            Set-DnsClientNrptGlobal -QueryPolicy QueryIPv6Only -ErrorAction SilentlyContinue
-            
-            Write-Log -Level SUCCESS -Message "✓ DNS security features enabled"
-        } catch {
-            Write-Log -Level WARN -Message "Some security features may not be available: $($_.Exception.Message)"
-        }
-    }
-    
+    # NOTE: earlier versions called Set-DnsClientNrptGlobal -EnableDAForAllNetworks
+    # and -QueryPolicy QueryIPv6Only. Those are DirectAccess/NRPT settings, not
+    # DNSSEC, were never rolled back, and could break name resolution, so they
+    # were removed. The Windows stub resolver does not validate DNSSEC itself;
+    # validation is performed by the upstream resolvers (Cloudflare/Quad9).
+    Write-Log -Level INFO -Message "DNSSEC is validated by the upstream resolvers; no local changes needed"
     return $true
 }
 
@@ -615,7 +629,14 @@ function Install-SecureDns {
     
     # Enable DNS-over-HTTPS
     Write-Section "Enabling DNS-over-HTTPS"
-    Enable-DnsOverHttps
+    Enable-DnsOverHttps | Out-Null
+
+    # Record which DoH entries we created so rollback removes only those
+    if (-not $DryRun -and (Test-Path $backupFile)) {
+        $b = Get-Content -Path $backupFile -Raw | ConvertFrom-Json
+        $b.AddedDohServers = @($Script:AddedDohServers)
+        $b | ConvertTo-Json -Depth 10 | Set-Content -Path $backupFile
+    }
     
     # Optimize DNS cache
     Write-Section "Optimizing DNS Cache"
@@ -642,9 +663,8 @@ function Install-SecureDns {
     Write-Log -Level SUCCESS -Message "Secure DNS configuration completed successfully!"
     Write-Host ""
     Write-Log -Level INFO -Message "Configuration Summary:"
-    Write-Log -Level INFO -Message "  Primary DNS:   Cloudflare (1.1.1.1, 1.0.0.1)"
-    Write-Log -Level INFO -Message "  Secondary DNS: Quad9 (9.9.9.9, 149.112.112.112)"
-    Write-Log -Level INFO -Message "  Tertiary DNS:  Google (8.8.8.8, 8.8.4.4)"
+    Write-Log -Level INFO -Message "  Adapter DNS:   $($Script:Config.AdapterServers -join ', ')"
+    Write-Log -Level INFO -Message "  DoH entries added: $(if ($Script:AddedDohServers.Count) { $Script:AddedDohServers -join ', ' } else { 'none (existing entries reused)' })"
     Write-Log -Level INFO -Message "  DoH Protocol:  Enabled"
     Write-Log -Level INFO -Message "  Backup File:   $backupFile"
     Write-Host ""
