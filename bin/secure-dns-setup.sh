@@ -201,7 +201,7 @@ backup_config() {
     if [ -e "$file" ] || [ -L "$file" ]; then
         run cp -a "$file" "$backup"
         state_add "backup=$file|$backup"
-        log INFO "Backed up $file -> $backup"
+        [ "$DRY_RUN" = true ] || log INFO "Backed up $file -> $backup"
     else
         state_add "created=$file"
     fi
@@ -371,11 +371,95 @@ local_resolver_works() {
 }
 
 # ============================================================================
+# Test helpers
+# ============================================================================
+
+# dig server arguments used by the tests. Pre-configuration tests query the
+# current system resolver (/etc/resolv.conf); post-configuration tests query
+# the new dnsmasq on 127.0.0.1.
+DIG_TARGET=()
+DIG_OPTS=(+time=3 +tries=1)
+
+set_test_target() {
+    case "$1" in
+        pre-configuration|current) DIG_TARGET=() ;;
+        *) DIG_TARGET=("@127.0.0.1" -p "$DNS_PORT") ;;
+    esac
+}
+
+describe_target() {
+    if [ ${#DIG_TARGET[@]} -eq 0 ]; then
+        echo "system resolver ($(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null || echo unknown))"
+    else
+        echo "127.0.0.1:$DNS_PORT"
+    fi
+}
+
+# Print the listening sockets as "proto local_address users" lines.
+listening_sockets() {
+    if command -v ss &>/dev/null; then
+        ss -Hlnptu 2>/dev/null | awk '{print $1, $5, $7}'
+    elif command -v netstat &>/dev/null; then
+        netstat -lnptu 2>/dev/null | awk '/^(tcp|udp)/{print $1, $4, $7}'
+    fi
+}
+
+# is_listening ADDR PORT - exact local address match (127.0.0.1 != 127.0.0.53)
+is_listening() {
+    local addr="$1" port="$2"
+    listening_sockets | awk -v a="$addr" -v p="$port" '
+        { la=$2; sub(/%[^:]*:/, ":", la) }      # strip "%lo" interface suffix
+        la == a ":" p || la == "[" a "]:" p { found=1 }
+        END { exit !found }'
+}
+
+# port_owner ADDR PORT - process name(s) bound to ADDR:PORT, or a hint
+port_owner() {
+    local addr="$1" port="$2" names
+    names=$(listening_sockets | awk -v a="$addr" -v p="$port" '
+        { la=$2; sub(/%[^:]*:/, ":", la) }
+        la == a ":" p || la == "[" a "]:" p {
+            u=$3
+            while (match(u, /\(\("[^"]+"/)) {
+                print substr(u, RSTART+3, RLENGTH-4); u=substr(u, RSTART+RLENGTH)
+            }
+        }' | sort -u | paste -sd, -)
+    if [ -n "$names" ]; then
+        echo "$names"
+    else
+        echo "unknown (run as root to see)"
+    fi
+}
+
+# Best guess at who owns 127.0.0.1:53 when ss cannot show it (non-root)
+guess_local53_owner() {
+    local owner
+    owner=$(port_owner 127.0.0.1 "$DNS_PORT")
+    if [[ "$owner" != unknown* ]]; then
+        echo "$owner"; return
+    fi
+    if [ "$(service_state "$DNSMASQ_SERVICE")" = active ]; then
+        echo "dnsmasq (probably; $owner)"
+    elif [ "$(service_state "$STUBBY_SERVICE")" = active ] && ! grep -q "@$STUBBY_PORT" "$STUBBY_CONFIG" 2>/dev/null; then
+        echo "stubby with its default config (probably; $owner)"
+    else
+        echo "$owner"
+    fi
+}
+
+service_state() {
+    local st
+    st=$(systemctl is-active "$1" 2>/dev/null) || true
+    echo "${st:-unknown}"
+}
+
+# ============================================================================
 # Connectivity Test Functions
 # ============================================================================
 
 test_connectivity() {
     local phase="${1:-current}"
+    set_test_target "$phase"
     log_section "Connectivity Test Results ($phase)"
     
     local passed=0
@@ -457,115 +541,99 @@ test_connectivity() {
 }
 
 test_dns_resolution() {
-    log INFO "Testing DNS resolution for multiple domains..."
-    
+    log INFO "Testing DNS resolution via $(describe_target)..."
+
     local domains=("google.com" "cloudflare.com" "quad9.net")
-    local all_passed=true
-    
+    local all_passed=true domain result rc
+
     for domain in "${domains[@]}"; do
-        local result
-        if result=$(dig +short "$domain" @127.0.0.1 -p "$DNS_PORT" 2>/dev/null); then
-            if [ -n "$result" ]; then
-                log INFO "  ✓ $domain resolved successfully: $result"
-            else
-                log WARN "  ✗ $domain: No IP returned"
-                all_passed=false
-            fi
+        rc=0
+        result=$(dig +short "${DIG_OPTS[@]}" A "$domain" "${DIG_TARGET[@]}" 2>&1) || rc=$?
+        # dig +short prints CNAMEs too; keep only IPv4 addresses
+        local ips
+        ips=$(printf '%s\n' "$result" | grep -E '^[0-9]+(\.[0-9]+){3}$' | paste -sd' ' - || true)
+        if [ -n "$ips" ]; then
+            log INFO "  ✓ $domain resolved: $ips"
+        elif [ "$rc" -ne 0 ]; then
+            log WARN "  ✗ $domain: query failed ($(printf '%s' "$result" | grep -m1 . || echo "dig exit $rc"))"
+            all_passed=false
         else
-            log WARN "  ✗ $domain: Resolution failed"
+            log WARN "  ✗ $domain: no A record returned"
             all_passed=false
         fi
     done
-    
+
     if [ "$all_passed" = true ]; then
         log INFO "DNS Resolution Test: PASSED"
         return 0
-    else
-        log ERROR "DNS Resolution Test: FAILED"
-        return 1
     fi
+    log ERROR "DNS Resolution Test: FAILED"
+    return 1
 }
 
 test_port_connectivity() {
     log INFO "Testing port connectivity..."
-    
-    local dnsmasq_listening=false
-    local stubby_listening=false
-    
-    # Test DNSMasq (port 53)
-    if ss -tuln 2>/dev/null | grep -qE "[:.]$DNS_PORT\s" || netstat -tuln 2>/dev/null | grep -qE "[:.]$DNS_PORT\s"; then
-        log INFO "  ✓ DNSMasq listening on 127.0.0.1:$DNS_PORT"
-        dnsmasq_listening=true
+
+    local dnsmasq_ok=false stubby_ok=false owner
+
+    if is_listening 127.0.0.1 "$DNS_PORT"; then
+        owner=$(guess_local53_owner)
+        if [[ "$owner" == dnsmasq* ]]; then
+            log INFO "  ✓ dnsmasq listening on 127.0.0.1:$DNS_PORT"
+            dnsmasq_ok=true
+        else
+            log WARN "  ✗ 127.0.0.1:$DNS_PORT is in use, but not by dnsmasq: $owner"
+        fi
     else
-        log WARN "  ✗ DNSMasq not detected on 127.0.0.1:$DNS_PORT"
+        log WARN "  ✗ Nothing listening on 127.0.0.1:$DNS_PORT"
     fi
-    
-    # Test Stubby ($STUBBY_PORT)
-    if ss -tuln 2>/dev/null | grep -qE "[:.]$STUBBY_PORT\s" || netstat -tuln 2>/dev/null | grep -qE "[:.]$STUBBY_PORT\s"; then
-        log INFO "  ✓ Stubby listening on 127.0.0.1:$STUBBY_PORT"
-        stubby_listening=true
+
+    if is_listening 127.0.0.1 "$STUBBY_PORT"; then
+        owner=$(port_owner 127.0.0.1 "$STUBBY_PORT")
+        if [[ "$owner" == stubby* ]] || { [[ "$owner" == unknown* ]] && [ "$(service_state "$STUBBY_SERVICE")" = active ]; }; then
+            log INFO "  ✓ Stubby listening on 127.0.0.1:$STUBBY_PORT"
+            stubby_ok=true
+        else
+            log WARN "  ✗ 127.0.0.1:$STUBBY_PORT is in use by: $owner"
+        fi
     else
-        log WARN "  ✗ Stubby not detected on 127.0.0.1:$STUBBY_PORT"
+        log WARN "  ✗ Stubby not listening on 127.0.0.1:$STUBBY_PORT"
     fi
-    
-    # Test connectivity to ports
-    if timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/$DNS_PORT" 2>/dev/null; then
-        log INFO "  ✓ Can connect to 127.0.0.1:$DNS_PORT"
-    else
-        log WARN "  ✗ Cannot connect to 127.0.0.1:$DNS_PORT"
-    fi
-    
-    if [ "$dnsmasq_listening" = true ] && [ "$stubby_listening" = true ]; then
+
+    if [ "$dnsmasq_ok" = true ] && [ "$stubby_ok" = true ]; then
         log INFO "Port Connectivity Test: PASSED"
         return 0
-    else
-        log ERROR "Port Connectivity Test: FAILED"
-        return 1
     fi
+    log ERROR "Port Connectivity Test: FAILED"
+    return 1
 }
 
 test_service_status() {
     log INFO "Testing service status..."
-    
-    local services_status=true
-    
-    # Check Stubby
-    if command -v systemctl &>/dev/null; then
-        local stubby_status
-        stubby_status=$(systemctl is-active stubby 2>/dev/null || echo "inactive")
-        if [ "$stubby_status" = "active" ]; then
-            log INFO "  ✓ Stubby service is active"
-        else
-            log WARN "  ✗ Stubby service is not active (status: $stubby_status)"
-            services_status=false
-        fi
-        
-        # Check DNSMasq
-        local dnsmasq_status
-        dnsmasq_status=$(systemctl is-active dnsmasq 2>/dev/null || echo "inactive")
-        if [ "$dnsmasq_status" = "active" ]; then
-            log INFO "  ✓ DNSMasq service is active"
-        else
-            log WARN "  ✗ DNSMasq service is not active (status: $dnsmasq_status)"
-            services_status=false
-        fi
-        
-        # Show systemd status details
-        if [ "$VERBOSE" = true ]; then
-            log DEBUG "Stubby systemd status: $(systemctl is-enabled stubby 2>/dev/null || echo 'unknown')"
-            log DEBUG "DNSMasq systemd status: $(systemctl is-enabled dnsmasq 2>/dev/null || echo 'unknown')"
-        fi
-    else
+
+    if ! command -v systemctl &>/dev/null; then
         log WARN "systemd not available - skipping service status checks"
+        return 0
     fi
-    
-    if [ "$services_status" = true ]; then
+
+    local services_ok=true svc st
+    for svc in "$STUBBY_SERVICE" "$DNSMASQ_SERVICE"; do
+        st=$(service_state "$svc")
+        if [ "$st" = "active" ]; then
+            log INFO "  ✓ $svc service is active"
+        else
+            log WARN "  ✗ $svc service is not active (status: $st)"
+            services_ok=false
+        fi
+        log DEBUG "$svc enabled: $(systemctl is-enabled "$svc" 2>/dev/null || true)"
+    done
+
+    if [ "$services_ok" = true ]; then
         log INFO "Service Status Test: PASSED"
         return 0
-    else
-        log ERROR "Service Status Test: FAILED"
-        return 1
     fi
+    log ERROR "Service Status Test: FAILED"
+    return 1
 }
 
 test_dnssec_validation() {
@@ -575,7 +643,7 @@ test_dnssec_validation() {
     # The AD (Authenticated Data) flag indicates successful DNSSEC validation
     local test_domain="dnssec-examples.com"
     local result
-    result=$(dig +short "$test_domain" @127.0.0.1 -p "$DNS_PORT" +dnssec 2>/dev/null || true)
+    result=$(dig +short "${DIG_OPTS[@]}" "$test_domain" "${DIG_TARGET[@]}" +dnssec 2>/dev/null || true)
     
     if [ -n "$result" ]; then
         log INFO "  ✓ DNSSEC query returned results"
@@ -591,7 +659,7 @@ test_dnssec_validation() {
     
     # Alternative: Check if DNSSEC is being requested
     local dnssec_check
-    dnssec_check=$(dig +noall +answer +dnssec +short sigok.verteiltesysteme.net @127.0.0.1 -p "$DNS_PORT" 2>/dev/null || true)
+    dnssec_check=$(dig "${DIG_OPTS[@]}" +noall +answer +dnssec +short sigok.verteiltesysteme.net "${DIG_TARGET[@]}" 2>/dev/null || true)
     
     if [ -n "$dnssec_check" ]; then
         log INFO "  ✓ DNSSEC validation working (sigok.verteiltesysteme.net)"
@@ -599,7 +667,7 @@ test_dnssec_validation() {
         return 0
     else
         # Try another test
-        dnssec_check=$(dig +noall +answer +dnssec +short dnssec.verteiltesysteme.net @127.0.0.1 -p "$DNS_PORT" 2>/dev/null || true)
+        dnssec_check=$(dig "${DIG_OPTS[@]}" +noall +answer +dnssec +short dnssec.verteiltesysteme.net "${DIG_TARGET[@]}" 2>/dev/null || true)
         if [ -n "$dnssec_check" ]; then
             log INFO "  ✓ DNSSEC validation working (dnssec.verteiltesysteme.net)"
             log INFO "DNSSEC Validation Test: PASSED"
@@ -625,7 +693,7 @@ test_latency() {
         # Multiple queries to test caching
         for i in {1..3}; do
             start=$(date +%s%N)
-            dig +short "$domain" @127.0.0.1 -p "$DNS_PORT" &>/dev/null || true
+            dig +short "${DIG_OPTS[@]}" "$domain" "${DIG_TARGET[@]}" &>/dev/null || true
             end=$(date +%s%N)
             
             duration=$(( (end - start) / 1000000 ))
@@ -640,7 +708,7 @@ test_latency() {
     
     # Test with dig +stats for accurate timing
     local stats
-    stats=$(dig google.com @127.0.0.1 -p "$DNS_PORT" +stats 2>&1 | grep "Query time:" || true)
+    stats=$(dig "${DIG_OPTS[@]}" google.com "${DIG_TARGET[@]}" +stats 2>&1 | grep "Query time:" || true)
     
     if [ -n "$stats" ]; then
         local query_time
@@ -707,9 +775,9 @@ test_fallback_servers() {
     else
         log WARN "  ! Stubby config not found - using service resolution test"
         
-        # Alternative: Test with nslookup
-        if nslookup google.com 127.0.0.1 &>/dev/null; then
-            log INFO "  ✓ DNS resolution working through stubby"
+        # Alternative: test resolution directly
+        if [ -n "$(dig +short "${DIG_OPTS[@]}" google.com "${DIG_TARGET[@]}" 2>/dev/null || true)" ]; then
+            log INFO "  ✓ DNS resolution working via $(describe_target)"
             log INFO "Fallback Server Test: PASSED (basic test)"
             return 0
         else
@@ -722,51 +790,56 @@ test_fallback_servers() {
 
 test_conflict_detection() {
     log INFO "Testing for port conflicts with other DNS services..."
-    
-    local conflicts_found=false
-    local conflicting_process
-    
-    # Check if anything is already using port 53
-    if ss -tuln 2>/dev/null | grep -qE "[:.]$DNS_PORT\s"; then
-        conflicting_process=$(ss -tlnp 2>/dev/null | grep -E "[:.]$DNS_PORT\s" | awk '{print $7}' || echo "unknown")
-        log WARN "  ✗ Port $DNS_PORT is already in use by: $conflicting_process"
-        log WARN "  This may cause DNS resolution failures"
-        log INFO "  Remediation: Stop the conflicting service or change the port"
-        conflicts_found=true
-    fi
-    
-    # Check if anything is already using the Stubby port
-    if ss -tuln 2>/dev/null | grep -qE "[:.]$STUBBY_PORT\s"; then
-        conflicting_process=$(ss -tlnp 2>/dev/null | grep -E "[:.]$STUBBY_PORT\s" | awk '{print $7}' || echo "unknown")
-        log WARN "  ✗ Port $STUBBY_PORT is already in use by: $conflicting_process"
-        log INFO "  Remediation: Stop the conflicting service or change the port"
-        conflicts_found=true
-    fi
-    
-    # Check for common DNS services that might conflict
-    local conflicting_services=("systemd-resolved" "bind9" "named" "unbound" "knot")
-    
-    for service in "${conflicting_services[@]}"; do
-        if command -v systemctl &>/dev/null; then
-            if [ "$service" = "systemd-resolved" ]; then
-                if systemctl is-active "$service" &>/dev/null; then
-                    log INFO "  i systemd-resolved is active; setup installs $RESOLVED_DROPIN (DNSStubListener=no)"
-                fi
-            elif systemctl is-active "$service" &>/dev/null; then
-                log WARN "  ! $service is running and may conflict"
-                log INFO "  Remediation: sudo systemctl stop $service"
-            fi
+
+    local conflicts_found=false owner addr
+
+    # systemd-resolved's stub (127.0.0.53/127.0.0.54) does not collide with
+    # 127.0.0.1:53, and the setup turns the stub off anyway.
+    for addr in 127.0.0.53 127.0.0.54; do
+        if is_listening "$addr" "$DNS_PORT"; then
+            log INFO "  i $addr:$DNS_PORT is systemd-resolved's stub; setup disables it via $RESOLVED_DROPIN"
         fi
     done
-    
-    if [ "$conflicts_found" = true ]; then
-        log INFO "Conflict Detection Test: PASSED (conflicts detected - see warnings)"
-        return 0  # Don't fail, just warn
-    else
-        log INFO "  ✓ No port conflicts detected"
-        log INFO "Conflict Detection Test: PASSED"
-        return 0
+
+    if is_listening 127.0.0.1 "$DNS_PORT"; then
+        owner=$(guess_local53_owner)
+        case "$owner" in
+            dnsmasq*) log INFO "  i 127.0.0.1:$DNS_PORT already served by $owner (will be reconfigured)" ;;
+            stubby*)  log INFO "  i 127.0.0.1:$DNS_PORT served by $owner; setup moves Stubby to $STUBBY_PORT before starting dnsmasq" ;;
+            *)
+                log WARN "  ✗ 127.0.0.1:$DNS_PORT is already in use by: $owner"
+                log INFO "  Remediation: stop that service, or it will block dnsmasq"
+                conflicts_found=true
+                ;;
+        esac
     fi
+
+    if is_listening 127.0.0.1 "$STUBBY_PORT"; then
+        owner=$(port_owner 127.0.0.1 "$STUBBY_PORT")
+        if [[ "$owner" == stubby* ]]; then
+            log INFO "  i 127.0.0.1:$STUBBY_PORT already served by stubby"
+        else
+            log WARN "  ✗ 127.0.0.1:$STUBBY_PORT is already in use by: $owner"
+            conflicts_found=true
+        fi
+    fi
+
+    local service
+    for service in bind9 named unbound knot-resolver; do
+        if [ "$(service_state "$service")" = active ]; then
+            log WARN "  ! $service is running and may conflict"
+            log INFO "  Remediation: sudo systemctl stop $service"
+            conflicts_found=true
+        fi
+    done
+
+    if [ "$conflicts_found" = true ]; then
+        log WARN "Conflict Detection Test: PASSED (conflicts detected - see warnings)"
+    else
+        log INFO "  ✓ No conflicting DNS listeners"
+        log INFO "Conflict Detection Test: PASSED"
+    fi
+    return 0
 }
 
 # ============================================================================
@@ -875,7 +948,7 @@ rollback() {
                 file="${val%%|*}"; backup="${val#*|}"
                 if [ -e "$backup" ] || [ -L "$backup" ]; then
                     run cp -a --remove-destination "$backup" "$file"
-                    log INFO "Restored $file from $backup (backup kept)"
+                    [ "$DRY_RUN" = true ] || log INFO "Restored $file from $backup (backup kept)"
                 else
                     log WARN "Backup $backup missing; cannot restore $file"
                 fi
@@ -883,7 +956,7 @@ rollback() {
             created)
                 if [ -e "$val" ] || [ -L "$val" ]; then
                     run rm -f "$val"
-                    log INFO "Removed $val (did not exist before)"
+                    [ "$DRY_RUN" = true ] || log INFO "Removed $val (did not exist before)"
                 fi
                 ;;
             service)
@@ -911,7 +984,7 @@ rollback() {
     if [ "$DRY_RUN" != true ]; then
         mv "$STATE_FILE" "$STATE_FILE.rolledback.$(date +%Y%m%d%H%M%S)"
     fi
-    log INFO "Rollback completed (backup files were kept)"
+    if [ "$DRY_RUN" = true ]; then log INFO "Dry-run rollback finished; nothing was changed"; else log INFO "Rollback completed (backup files were kept)"; fi
 }
 
 # ============================================================================
