@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2034  # "out" is read inside eval in check()
 # Unit tests for bin/secure-dns-setup.sh. Safe: no root, no system changes.
 # Uses a temp dir for all paths and a fake systemctl on PATH.
 set -euo pipefail
@@ -38,7 +39,6 @@ out=$(bash -c "set -euo pipefail; source '$SCRIPT'
 check "test_connectivity counts failures and does not abort" '[ "$out" = "rc=2" ]'
 
 # 2. Argument parsing order independence and conflicts
-# shellcheck disable=SC2034  # read inside eval in check()
 out=$(bash -c "source '$SCRIPT'; parse_args --rollback --verbose --dry-run -y; echo \"\$ACTION \$VERBOSE \$DRY_RUN \$ASSUME_YES\"")
 check "flags after action are parsed" '[ "$out" = "rollback true true true" ]'
 if bash "$SCRIPT" --rollback --run-tests >/dev/null 2>&1; then bad "conflicting actions rejected"; else ok "conflicting actions rejected"; fi
@@ -86,6 +86,43 @@ check "rollback removed resolved drop-in" '[ ! -e "$TMP/etc/resolved.conf.d/setd
 check "rollback restored stubby to disabled+stopped" 'grep -qx "disable stubby" "$SYSTEMCTL_LOG" && grep -qx "stop stubby" "$SYSTEMCTL_LOG"'
 check "rollback restored dnsmasq to enabled+active" 'grep -qx "enable dnsmasq" "$SYSTEMCTL_LOG" && grep -qx "restart dnsmasq" "$SYSTEMCTL_LOG"'
 check "state file archived" 'ls "$STATE_DIR"/state.rolledback.* >/dev/null 2>&1 && [ ! -e "$STATE_DIR/state" ]'
+
+# 6. Socket matching: exact address, owner names, non-root fallback
+cat > "$TMP/bin/ss" <<'FAKE'
+#!/bin/bash
+cat "$SS_FIXTURE"
+FAKE
+chmod +x "$TMP/bin/ss"
+export SS_FIXTURE="$TMP/ss.txt"
+cat > "$SS_FIXTURE" <<'SS'
+udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=1,fd=1))
+tcp LISTEN 0 4096 127.0.0.54:53 0.0.0.0:* users:(("systemd-resolve",pid=1,fd=2))
+udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:* users:(("avahi-daemon",pid=2,fd=3))
+SS
+check "resolved stub is not 127.0.0.1:53" '! bash -c "source \"$SCRIPT\"; is_listening 127.0.0.1 53"'
+check "127.0.0.53%lo:53 is matched exactly" 'bash -c "source \"$SCRIPT\"; is_listening 127.0.0.53 53"'
+check "owner name parsed from users:((...))" '[ "$(bash -c "source \"$SCRIPT\"; port_owner 127.0.0.53 53")" = systemd-resolve ]'
+echo 'tcp LISTEN 0 16 127.0.0.1:53 0.0.0.0:*' >> "$SS_FIXTURE"
+check "127.0.0.1:53 detected" 'bash -c "source \"$SCRIPT\"; is_listening 127.0.0.1 53"'
+check "owner unknown without root" '[ "$(bash -c "source \"$SCRIPT\"; port_owner 127.0.0.1 53")" = "unknown (run as root to see)" ]'
+out=$(bash -c "source '$SCRIPT'; service_state() { echo inactive; }; test_port_connectivity" 2>&1 || true)
+check "port test does not claim dnsmasq when it is inactive" '! grep -q "dnsmasq listening" <<< "$out"'
+out=$(bash -c "source '$SCRIPT'; test_conflict_detection" 2>&1)
+check "resolved stub reported as info, not conflict" 'grep -q "systemd-resolved.s stub" <<< "$out"'
+check "conflict owner is never empty" '! grep -qE "in use by: *$" <<< "$out"'
+
+# 7. service_state prints a single word
+check "service_state single line for inactive" '[ "$(bash -c "source \"$SCRIPT\"; service_state stubby")" = inactive ]'
+
+# 8. Test target: pre-config uses system resolver, post-config uses 127.0.0.1
+check "pre-configuration uses system resolver" '[ "$(bash -c "source \"$SCRIPT\"; set_test_target pre-configuration; echo \${#DIG_TARGET[@]}")" = 0 ]'
+check "post-configuration uses 127.0.0.1" '[ "$(bash -c "source \"$SCRIPT\"; set_test_target post-configuration; echo \${DIG_TARGET[0]}")" = "@127.0.0.1" ]'
+
+# 9. Dry run never claims a backup was made
+echo x > "$TMP/f"
+out=$(bash -c "source '$SCRIPT'; DRY_RUN=true; backup_config '$TMP/f'" 2>&1)
+check "dry-run backup logs no 'Backed up'" '! grep -q "Backed up" <<< "$out" && grep -q "would run: cp" <<< "$out"'
+check "dry-run left no backup file" '! ls "$TMP"/f.bak.* >/dev/null 2>&1'
 
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
