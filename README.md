@@ -6,6 +6,27 @@
 
 SetDNScache provides secure DNS over TLS with local caching for enhanced privacy, security, and performance. It implements a robust DNS hierarchy with automatic failover, DNSSEC validation, and comprehensive testing capabilities.
 
+> **What changed (fix/review-issues):**
+> - Stubby listens on **127.0.0.1:5453** (5353 is mDNS/avahi on most desktops).
+> - Upstreams are authenticated by **certificate name** (`tls_auth_name`) only; the
+>   placeholder SPKI pins were removed (stale pins make Stubby reject servers).
+> - **systemd-resolved is not stopped or disabled.** The script installs
+>   `/etc/systemd/resolved.conf.d/setdnscache.conf` (`DNS=127.0.0.1`, `DNSStubListener=no`),
+>   repoints `/etc/resolv.conf` to `/run/systemd/resolve/resolv.conf` if it used the stub,
+>   and only does so after dnsmasq/Stubby answer on 127.0.0.1.
+> - dnsmasq uses `proxy-dnssec` (upstream validates DNSSEC) and honours `/etc/hosts`.
+> - `--dry-run` really changes nothing and works without root; `--yes` skips the
+>   apt install prompt; options can be given in any order.
+> - `--rollback` replays `/var/lib/setdnscache/state`: restores every backed-up file,
+>   removes files the script created (including the resolved drop-in), and returns
+>   stubby/dnsmasq/systemd-resolved to their original enabled/active state. Backups are kept.
+> - Windows: `-InterfaceAlias` selects adapters; 4 servers are set
+>   (1.1.1.1, 9.9.9.9, 1.0.0.1, 149.112.112.112); rollback removes only DoH entries the
+>   script added. Unit tests: `tests/unit/test-secure-dns-setup.sh` (no root needed).
+>
+> Older sections below that tell you to stop/disable systemd-resolved, overwrite
+> `/etc/resolv.conf`, or add `tls_pubkey_pinset` are superseded by the above.
+
 ## Table of Contents
 
 1. [Project Overview](#project-overview)
@@ -60,7 +81,7 @@ SetDNScache is a comprehensive DNS security solution that implements **DNS over 
                          │                     │
                   ┌──────▼──────┐      ┌──────▼──────┐
                   │    Stubby   │      │    Stubby   │
-                  │   Port 5353 │      │   Port 5353 │
+                  │   Port 5453 │      │   Port 5453 │
                   │ (DNS over   │      │ (DNS over   │
                   │   TLS)      │      │   TLS)      │
                   └──────┬──────┘      └──────┬──────┘
@@ -149,7 +170,7 @@ sudo bash bin/secure-dns-setup.sh
 
 4. **Service Activation** (10-15 seconds)
    - Stops conflicting DNS services
-   - Starts Stubby on port 5353
+   - Starts Stubby on port 5453
    - Starts DNSMasq on port 53
    - Updates system resolver configuration
 
@@ -262,7 +283,7 @@ sudo bash bin/secure-dns-setup.sh
 Request Flow:
 1. Application queries DNSMasq (port 53)
 2. DNSMasq checks local cache
-3. If not cached, queries Stubby (port 5353)
+3. If not cached, queries Stubby (port 5453)
 4. Stubby tries Cloudflare (primary)
 5. If Cloudflare fails, tries Quad9 (secondary)
 6. If Quad9 fails, tries Google (tertiary)
@@ -387,13 +408,11 @@ netstat -tuln | grep :53
 - Current DNS servers listed in `/etc/resolv.conf`
 
 **If conflicts found:**
+
+systemd-resolved does **not** need to be stopped: the setup script reconfigures it
+with a drop-in (`/etc/systemd/resolved.conf.d/setdnscache.conf`) that `--rollback` removes.
+
 ```bash
-# Stop systemd-resolved temporarily (backup current config first)
-sudo systemctl stop systemd-resolved
-
-# Disable systemd-resolved from starting on boot
-sudo systemctl disable systemd-resolved
-
 # Check what other services need to be stopped
 sudo systemctl stop bind9
 sudo systemctl disable bind9
@@ -579,7 +598,7 @@ systemctl status dnsmasq
 nslookup google.com
 
 # Check listening ports
-netstat -tuln | grep -E ":53|:5353"
+netstat -tuln | grep -E ":53|:5453"
 ```
 
 ### What Each Step Does
@@ -614,7 +633,7 @@ netstat -tuln | grep -E ":53|:5353"
 |-----------|-------------------|---------|
 | **Stubby** | `/etc/stubby/stubby.yml` | DNS-over-TLS settings, upstream servers |
 | **DNSMasq** | `/etc/dnsmasq.conf` | Cache settings, local DNS options |
-| **DNSMasq** | `/etc/dnsmasq.d/dns-stubby.conf` | Integration with Stubby |
+| **DNSMasq** | `/etc/dnsmasq.d/stubby-forward.conf` | Integration with Stubby |
 | **System Resolver** | `/etc/resolv.conf` | System-wide DNS configuration |
 | **Service Files** | `/etc/systemd/system/stubby.service` | Stubby systemd service |
 | **Service Files** | `/etc/systemd/system/dnsmasq.service` | DNSMasq systemd service |
@@ -624,13 +643,13 @@ netstat -tuln | grep -E ":53|:5353"
 | Service | Port | Purpose | Protocol |
 |---------|------|---------|----------|
 | **DNSMasq** | 53 | Local DNS service | UDP/TCP |
-| **Stubby** | 5353 | Local DNS-over-TLS proxy | UDP/TCP |
+| **Stubby** | 5453 | Local DNS-over-TLS proxy | UDP/TCP |
 | **Upstream DoT** | 853 | Encrypted DNS to providers | TCP |
 | **System Resolver** | 53 | Application DNS queries | UDP/TCP |
 
 **Port Conflict Resolution:**
 - **Port 53**: Stops any existing DNS service
-- **Port 5353**: Typically unused by default
+- **Port 5453**: Typically unused by default
 - **Port 853**: External TLS connections only
 
 ### Service Dependencies
@@ -717,7 +736,7 @@ sudo bash bin/secure-dns-setup.sh --run-tests --verbose
 [INFO] 2024-01-11 13:52:19 - DNS resolution for example.com: PASS
 [INFO] 2024-01-11 13:52:20 - Testing port connectivity...
 [INFO] 2024-01-11 13:52:20 - Port 53 (DNSMasq): OPEN
-[INFO] 2024-01-11 13:52:21 - Port 5353 (Stubby): OPEN
+[INFO] 2024-01-11 13:52:21 - Port 5453 (Stubby): OPEN
 [INFO] 2024-01-11 13:52:22 - Testing service status...
 [INFO] 2024-01-11 13:52:22 - DNSMasq service: ACTIVE
 [INFO] 2024-01-11 13:52:23 - Stubby service: ACTIVE
@@ -765,11 +784,11 @@ sudo bash bin/secure-dns-setup.sh --run-tests --verbose
 
 **Ports tested:**
 - **Port 53**: DNSMasq local DNS service
-- **Port 5353**: Stubby DNS-over-TLS proxy
+- **Port 5453**: Stubby DNS-over-TLS proxy
 
 **What it tests:**
 - DNSMasq service is listening on port 53
-- Stubby service is listening on port 5353
+- Stubby service is listening on port 5453
 - No port conflicts or access restrictions
 - Firewall rules permit local connections
 
@@ -782,7 +801,7 @@ sudo bash bin/secure-dns-setup.sh --run-tests --verbose
 ```
 [INFO] 2024-01-11 13:52:20 - Testing port connectivity...
 [INFO] 2024-01-11 13:52:20 - Port 53 (DNSMasq): OPEN
-[INFO] 2024-01-11 13:52:21 - Port 5353 (Stubby): OPEN
+[INFO] 2024-01-11 13:52:21 - Port 5453 (Stubby): OPEN
 ```
 
 #### 3. Service Status Test
@@ -966,7 +985,7 @@ systemctl status dnsmasq
 systemctl status stubby
 
 # Test direct Stubby query
-nslookup -port=5353 google.com localhost
+nslookup -port=5453 google.com localhost
 ```
 
 **Common causes and solutions:**
@@ -1065,7 +1084,7 @@ sudo bash tests/pre-reboot-check.sh > /tmp/pre-reboot-results.txt 2>&1
 ✓ Stubby service: ACTIVE
 [2024-01-11 13:52:18] Verifying port connectivity...
 ✓ Port 53 (DNSMasq): OPEN
-✓ Port 5353 (Stubby): OPEN
+✓ Port 5453 (Stubby): OPEN
 [2024-01-11 13:52:19] Testing DNSSEC validation...
 ✓ DNSSEC validation: PASS
 [2024-01-11 13:52:20] Pre-reboot check completed successfully!
@@ -1311,9 +1330,10 @@ sudo bash bin/secure-dns-setup.sh
 | `--help` | Display usage information | `sudo bash bin/secure-dns-setup.sh --help` |
 | `--run-tests` | Run connectivity tests only (no changes) | `sudo bash bin/secure-dns-setup.sh --run-tests` |
 | `--test-reboot` | Run comprehensive reboot survival tests | `sudo bash bin/secure-dns-setup.sh --test-reboot` |
-| `--rollback` | Restore previous configuration | `sudo bash bin/secure-dns-setup.sh --rollback` |
+| `--rollback` | Undo everything recorded in `/var/lib/setdnscache/state` | `sudo bash bin/secure-dns-setup.sh --rollback` |
 | `--verbose` | Enable detailed output | `sudo bash bin/secure-dns-setup.sh --verbose` |
-| `--dry-run` | Show what would be done (no changes) | `sudo bash bin/secure-dns-setup.sh --dry-run` |
+| `--dry-run` | Print every change, make none (no root needed) | `bash bin/secure-dns-setup.sh --dry-run` |
+| `--yes`, `-y` | Install missing packages without prompting | `sudo bash bin/secure-dns-setup.sh --yes` |
 
 #### Detailed Option Descriptions
 
@@ -1452,7 +1472,7 @@ sudo bash bin/secure-dns-setup.sh --run-tests --verbose
 
 **Test components:**
 - DNS resolution through secure chain
-- Port accessibility (53, 5353)
+- Port accessibility (53, 5453)
 - Service health status
 - DNSSEC validation functionality
 - Performance benchmarking
@@ -1537,8 +1557,8 @@ nslookup google.com
 # Query specific DNS server (DNSMasq on localhost)
 nslookup google.com localhost
 
-# Query Stubby directly (port 5353)
-nslookup -port=5353 google.com localhost
+# Query Stubby directly (port 5453)
+nslookup -port=5453 google.com localhost
 
 # Detailed query with statistics
 dig google.com
@@ -1616,24 +1636,24 @@ journalctl | grep -E "(stubby|dnsmasq|dns)"
 
 ```bash
 # Check DNS ports
-netstat -tuln | grep -E ":53|:5353"
+netstat -tuln | grep -E ":53|:5453"
 
 # Alternative with ss command
-ss -tuln | grep -E ":53|:5353"
+ss -tuln | grep -E ":53|:5453"
 
 # Check port ownership
 sudo lsof -i :53
-sudo lsof -i :5353
+sudo lsof -i :5453
 
 # Test local connectivity
 telnet localhost 53
-telnet localhost 5353
+telnet localhost 5453
 ```
 
 **Expected port status:**
 ```
 tcp        0      0 0.0.0.0:53              0.0.0.0:*               LISTEN      1234/dnsmasq
-tcp        0      0 127.0.0.1:5353          0.0.0.0:*               LISTEN      1235/stubby
+tcp        0      0 127.0.0.1:5453          0.0.0.0:*               LISTEN      1235/stubby
 ```
 
 #### DNSSEC Validation Testing
@@ -1715,8 +1735,8 @@ nslookup google.com
 # Test direct DNSMasq query
 nslookup google.com localhost
 
-# Test Stubby directly (port 5353)
-nslookup -port=5353 google.com localhost
+# Test Stubby directly (port 5453)
+nslookup -port=5453 google.com localhost
 
 # Test upstream DNS directly
 nslookup google.com 1.1.1.1
@@ -1809,18 +1829,18 @@ sudo journalctl | grep -E "(stubby|dnsmasq|dns)" | tail -20
 ```
 Jan 11 13:52:15 server stubby[1234]: [stubby] Starting stubby version 1.4.0
 Jan 11 13:52:15 server stubby[1234]: [stubby] Read 3 upstream servers
-Jan 11 13:52:15 server stubby[1234]: [stubby] Opening listen sockets on 127.0.0.1 port 5353
-Jan 11 13:52:16 server stubby[1234]: [stubby] Listening on 127.0.0.1 port 5353
+Jan 11 13:52:15 server stubby[1234]: [stubby] Opening listen sockets on 127.0.0.1 port 5453
+Jan 11 13:52:16 server stubby[1234]: [stubby] Listening on 127.0.0.1 port 5453
 ```
 
 **Successful DNSMasq startup:**
 ```
 Jan 11 13:52:16 server dnsmasq[1235]: started, version 2.80 cachesize 10000
 Jan 11 13:52:16 server dnsmasq[1235]: compile time options: IPv6 GNU-getopt DBus no-i18n IDN DHCP DHCPv6 no-Lua TFTP no-conntrack no-ipset no-auth no-DNSSEC loop-detect
-Jan 11 13:52:16 server dnsmasq[1235]: using nameserver 127.0.0.1#5353
+Jan 11 13:52:16 server dnsmasq[1235]: using nameserver 127.0.0.1#5453
 Jan 11 13:52:16 server dnsmasq[1235]: reading /etc/resolv.conf
-Jan 11 13:52:16 server dnsmasq[1235]: using nameserver 127.0.0.1#5353
-Jan 11 13:52:16 server dnsmasq[1235]: using nameserver 127.0.0.1#5353
+Jan 11 13:52:16 server dnsmasq[1235]: using nameserver 127.0.0.1#5453
+Jan 11 13:52:16 server dnsmasq[1235]: using nameserver 127.0.0.1#5453
 ```
 
 ### Check Listening Ports
@@ -1829,42 +1849,42 @@ Jan 11 13:52:16 server dnsmasq[1235]: using nameserver 127.0.0.1#5353
 
 ```bash
 # Check DNS ports are listening
-netstat -tuln | grep -E ":53|:5353"
+netstat -tuln | grep -E ":53|:5453"
 
 # Alternative with ss command
-ss -tuln | grep -E ":53|:5353"
+ss -tuln | grep -E ":53|:5453"
 
 # Check which process owns each port
 sudo lsof -i :53
-sudo lsof -i :5353
+sudo lsof -i :5453
 
 # Test port connectivity locally
 telnet localhost 53
-telnet localhost 5353
+telnet localhost 5453
 ```
 
 **Expected port status:**
 ```
 tcp        0      0 0.0.0.0:53              0.0.0.0:*               LISTEN      1234/dnsmasq
-tcp        0      0 127.0.0.1:5353          0.0.0.0:*               LISTEN      1235/stubby
+tcp        0      0 127.0.0.1:5453          0.0.0.0:*               LISTEN      1235/stubby
 ```
 
 **Troubleshooting port issues:**
 
 ```bash
 # Check for port conflicts
-sudo netstat -tulpn | grep -E ":53|:5353"
+sudo netstat -tulpn | grep -E ":53|:5453"
 
 # Kill conflicting processes if needed
 sudo kill -9 <PID>
 
 # Test if ports are accessible
 nc -zv localhost 53
-nc -zv localhost 5353
+nc -zv localhost 5453
 
 # Check firewall rules
 sudo ufw status
-sudo iptables -L | grep -E "53|5353"
+sudo iptables -L | grep -E "53|5453"
 ```
 
 ### Test DNSSEC
@@ -2036,7 +2056,7 @@ nslookup google.com
 systemctl status stubby dnsmasq
 
 # Check port connectivity
-netstat -tuln | grep -E ":53|:5353"
+netstat -tuln | grep -E ":53|:5453"
 
 # Test upstream connectivity
 nslookup google.com 1.1.1.1
@@ -2127,7 +2147,7 @@ sudo systemctl restart stubby
 ```bash
 # Check which process is using the port
 sudo netstat -tulpn | grep :53
-sudo lsof -i :5353
+sudo lsof -i :5453
 
 # Check systemd-resolved status
 systemctl status systemd-resolved
@@ -2457,7 +2477,7 @@ listen_addresses:
 **Update DNSMasq configuration:**
 ```bash
 # Edit DNSMasq upstream configuration
-sudo nano /etc/dnsmasq.d/dns-stubby.conf
+sudo nano /etc/dnsmasq.d/stubby-forward.conf
 
 # Update upstream server port
 server=127.0.0.1#5555
@@ -2653,7 +2673,7 @@ dhcp-range=192.168.1.0,static,255.255.255.0
 dig AAAA google.com
 
 # Test IPv6 stubby connectivity
-nslookup -port=5353 -family=inet6 google.com localhost
+nslookup -port=5453 -family=inet6 google.com localhost
 ```
 
 ---
@@ -2746,7 +2766,7 @@ sudo iptables -L
 **Symptoms:**
 - `systemctl status stubby` shows "inactive" or "failed"
 - Service startup logs contain error messages
-- Port 53 or 5353 not listening
+- Port 53 or 5453 not listening
 - Configuration test commands fail
 
 **Diagnosis:**
@@ -2841,13 +2861,13 @@ sudo journalctl -u stubby --since "5 minutes ago"
 **Diagnosis:**
 ```bash
 # Check port usage
-sudo netstat -tulpn | grep -E ":53|:5353"
+sudo netstat -tulpn | grep -E ":53|:5453"
 
 # Find process using port 53
 sudo lsof -i :53
 
-# Find process using port 5353
-sudo lsof -i :5353
+# Find process using port 5453
+sudo lsof -i :5453
 
 # Check systemd services
 systemctl list-units --all | grep dns
@@ -2900,10 +2920,10 @@ sudo systemctl disable custom-dns
 ```bash
 # Force stop processes on conflicting ports
 sudo fuser -k 53/tcp
-sudo fuser -k 5353/tcp
+sudo fuser -k 5453/tcp
 
 # Verify ports are free
-sudo netstat -tulpn | grep -E ":53|:5353"
+sudo netstat -tulpn | grep -E ":53|:5453"
 
 # Restart DNS services
 sudo systemctl restart stubby
@@ -2969,7 +2989,7 @@ traceroute 1.1.1.1
 echo "cache-stats" | nc localhost 53
 
 # Verify DNSMasq is using Stubby
-cat /etc/dnsmasq.d/dns-stubby.conf
+cat /etc/dnsmasq.d/stubby-forward.conf
 
 # Increase cache size
 echo "cache-size=10000" | sudo tee -a /etc/dnsmasq.conf
@@ -3327,7 +3347,7 @@ sudo systemctl edit stubby
 ```bash
 # Find process using the port
 sudo netstat -tulpn | grep :53
-sudo netstat -tulpn | grep :5353
+sudo netstat -tulpn | grep :5453
 
 # Find process by name
 ps aux | grep stubby
@@ -3341,8 +3361,8 @@ ps aux | grep dnsmasq
 # Find and kill process using port 53
 sudo fuser -k 53/tcp
 
-# Find and kill process using port 5353
-sudo fuser -k 5353/tcp
+# Find and kill process using port 5453
+sudo fuser -k 5453/tcp
 
 # Alternative: kill by process name
 sudo killall stubby
@@ -3378,7 +3398,7 @@ sudo systemctl start dnsmasq
 sudo netstat -tulpn | grep dns
 
 # Verify ports are free
-sudo netstat -tuln | grep -E ":53|:5353"
+sudo netstat -tuln | grep -E ":53|:5453"
 
 # Restart DNS services
 sudo systemctl restart stubby
@@ -3389,11 +3409,14 @@ sudo systemctl restart dnsmasq
 
 ## Security Considerations
 
-### TLS Certificate Pinning
+### TLS Server Authentication
 
 **Cloudflare Certificate Validation:**
 
-Stubby uses TLS certificate pinning to ensure you're connecting to legitimate DNS providers:
+Stubby uses `tls_authentication: GETDNS_AUTHENTICATION_REQUIRED` and checks each server's
+certificate against the system CA store and the expected name (`tls_auth_name`). No SPKI
+pins are configured, because pins rotate with the providers' certificates and a stale pin
+makes Stubby reject that server:
 
 ```yaml
 # /etc/stubby/stubby.yml
@@ -3524,7 +3547,7 @@ Client → DNSMasq → Stubby → [TLS encrypted] → Cloudflare/Quad9/Google
 
 **Service Binding Requirements:**
 - DNSMasq needs to bind to port 53 (privileged port)
-- Stubby needs to bind to port 5353 (if using system port)
+- Stubby needs to bind to port 5453 (if using system port)
 - System resolver modification requires root privileges
 - Service configuration installation requires root access
 
@@ -3557,7 +3580,7 @@ sudo bash bin/secure-dns-setup.sh
 
 **Inbound Traffic:**
 - Port 53: Local DNS service (localhost only)
-- Port 5353: Stubby service (localhost only)
+- Port 5453: Stubby service (localhost only)
 
 **UFW Configuration:**
 ```bash
@@ -3630,8 +3653,8 @@ ps aux | grep dnsmasq
 # If using multiple interfaces, restrict DNS service
 # Edit /etc/stubby/stubby.yml
 listen_addresses:
-  - 127.0.0.1@5353  # Localhost only
-  - 192.168.1.1@5353  # Internal network only
+  - 127.0.0.1@5453  # Localhost only
+  - 192.168.1.1@5453  # Internal network only
 ```
 
 **6. Regular Security Audits:**
@@ -3849,10 +3872,10 @@ Savings: 1.2MB per day (80% reduction)
 ```bash
 # Monitor DNS traffic
 sudo tcpdump -i any port 53
-sudo tcpdump -i any port 5353
+sudo tcpdump -i any port 5453
 
 # Measure DNS bandwidth usage
-iftop -i eth0 -f "port 53 or port 5353"
+iftop -i eth0 -f "port 53 or port 5453"
 ```
 
 **Optimization for Bandwidth:**
@@ -3897,7 +3920,7 @@ time dig @8.8.8.8 google.com +stats
 # Use fastest network interface
 # Edit /etc/stubby/stubby.yml
 listen_addresses:
-  - 127.0.0.1@5353  # Use localhost
+  - 127.0.0.1@5453  # Use localhost
 
 # Avoid remote interfaces for local DNS
 ```
@@ -4065,7 +4088,7 @@ sudo bash bin/secure-dns-setup.sh --rollback --verbose
 
 2. **Removes Configurations**
    - `/etc/stubby/stubby.yml`
-   - `/etc/dnsmasq.d/dns-stubby.conf`
+   - `/etc/dnsmasq.d/stubby-forward.conf`
    - Service files in `/etc/systemd/system/`
 
 3. **Restores Original DNS**
@@ -4118,7 +4141,7 @@ echo "nameserver 8.8.4.4" | sudo tee -a /etc/resolv.conf
 sudo rm -f /etc/stubby/stubby.yml
 
 # Remove DNSMasq custom configuration
-sudo rm -f /etc/dnsmasq.d/dns-stubby.conf
+sudo rm -f /etc/dnsmasq.d/stubby-forward.conf
 
 # Remove service files
 sudo rm -f /etc/systemd/system/stubby.service
@@ -4240,7 +4263,7 @@ systemctl list-units --all | grep -E "(stubby|dnsmasq)"
 ps aux | grep -E "(stubby|dnsmasq)"
 
 # Check ports are free
-netstat -tuln | grep -E ":53|:5353"
+netstat -tuln | grep -E ":53|:5453"
 ```
 
 ### Cleanup Commands
@@ -4250,7 +4273,7 @@ netstat -tuln | grep -E ":53|:5353"
 ```bash
 # Remove all configuration files
 sudo rm -f /etc/stubby/stubby.yml
-sudo rm -f /etc/dnsmasq.d/dns-stubby.conf
+sudo rm -f /etc/dnsmasq.d/stubby-forward.conf
 sudo rm -f /etc/dnsmasq.d/cache-settings.conf
 
 # Remove log files
@@ -4325,7 +4348,7 @@ $ systemctl status systemd-resolved
 - [ ] `systemctl status` shows original DNS service active
 - [ ] `/etc/resolv.conf` points to original DNS servers
 - [ ] No SetDNScache processes running
-- [ ] Ports 53 and 5353 are free
+- [ ] Ports 53 and 5453 are free
 - [ ] Internet connectivity fully functional
 - [ ] Log files cleaned up
 
@@ -4360,20 +4383,9 @@ upstream_recursive_servers:
   - address_data: 45.90.28.0
     tls_auth_name: "your-account.nextdns.io"
     tls_port: 853
-    tls_pubkey_pinset:
-      - digest: "sha256"
-        value: "YOUR_CERTIFICATE_HASH"
   - address_data: 45.90.30.0
     tls_auth_name: "your-account.nextdns.io"
     tls_port: 853
-    tls_pubkey_pinset:
-      - digest: "sha256"
-        value: "YOUR_CERTIFICATE_HASH"
-
-# Enable DNSSEC
-dnssec:
-  getaddrinfo: 1
-  trustAnchor: https://www.internic.net/domain/root.key
 ```
 
 **CleanBrowsing (Family-Safe DNS):**
@@ -4412,19 +4424,18 @@ upstream_recursive_servers:
     tls_port: 853
 ```
 
-**Certificate Pinning for Enhanced Security:**
+**Optional SPKI pinning (advanced, not used by default):**
 ```bash
-# Get certificate hash for pinning
-echo | openssl s_client -servername cloudflare-dns.com -connect 1.1.1.1:853 2>/dev/null | openssl x509 -outform PEM | openssl x509 -noout -fingerprint -sha256
+# Stubby pins are base64 SHA-256 of the server's public key (SPKI), not a cert fingerprint
+echo | openssl s_client -servername cloudflare-dns.com -connect 1.1.1.1:853 2>/dev/null \
+  | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256 -binary | openssl enc -base64
 
-# Add to configuration
-upstream_recursive_servers:
-  - address_data: 1.1.1.1
-    tls_auth_name: "cloudflare-dns.com"
-    tls_port: 853
-    tls_pubkey_pinset:
-      - digest: "sha256"
-        value: "CERTIFICATE_FINGERPRINT_HERE"
+# upstream entry:
+#    tls_pubkey_pinset:
+#      - digest: "sha256"
+#        value: <output above>
+# Pins break when the provider rotates keys; you must update them yourself.
 ```
 
 ### DNS over HTTPS (DoH) Configuration
@@ -4461,7 +4472,7 @@ sudo tee /etc/dnsmasq.d/doh-proxy.conf << EOF
 server=127.0.0.1#5053
 
 # Fallback to DoT if DoH fails
-server=127.0.0.1#5353
+server=127.0.0.1#5453
 EOF
 
 # Restart DNSMasq
@@ -4550,7 +4561,7 @@ sudo systemctl restart dnsmasq
 dig AAAA google.com
 
 # Test IPv6 Stubby connectivity
-dig @127.0.0.1 -p 5353 AAAA google.com
+dig @127.0.0.1 -p 5453 AAAA google.com
 
 # Check IPv6 network connectivity
 ping6 2606:4700:4700::1111
@@ -4596,7 +4607,7 @@ sudo systemctl restart dnsmasq
 sudo ufw allow from 192.168.1.0/24 to any port 53
 
 # Allow DNS over TLS from local network
-sudo ufw allow from 192.168.1.0/24 to any port 5353
+sudo ufw allow from 192.168.1.0/24 to any port 5453
 
 # Or use iptables
 sudo iptables -A INPUT -p tcp --dport 53 -s 192.168.1.0/24 -j ACCEPT
@@ -4621,8 +4632,8 @@ curl -sSL https://install.pi-hole.net | bash
 
 # Configure Pi-hole to use Stubby
 sudo tee /etc/pihole/setupVars.conf << EOF
-PIHOLE_DNS_1=127.0.0.1#5353
-PIHOLE_DNS_2=127.0.0.1#5353
+PIHOLE_DNS_1=127.0.0.1#5453
+PIHOLE_DNS_2=127.0.0.1#5453
 EOF
 
 # Restart Pi-hole
@@ -4638,7 +4649,7 @@ sudo apt install unbound
 sudo tee /etc/unbound/unbound.conf.d/secure-dns.conf << EOF
 forward-zone:
   name: "."
-  forward-addr: 127.0.0.1@5353
+  forward-addr: 127.0.0.1@5453
 EOF
 
 # Restart Unbound
@@ -4651,7 +4662,7 @@ sudo systemctl restart unbound
 sudo mkdir -p /etc/systemd/resolved.conf.d
 sudo tee /etc/systemd/resolved.conf.d/secure-dns.conf << EOF
 [Resolve]
-DNS=127.0.0.1:5353
+DNS=127.0.0.1:5453
 DNSStubListener=no
 EOF
 
@@ -4990,7 +5001,7 @@ sudo systemctl restart stubby
 dig AAAA google.com
 
 # Test IPv6 DNS resolution
-dig @127.0.0.1 -p 5353 AAAA google.com
+dig @127.0.0.1 -p 5453 AAAA google.com
 ```
 
 **IPv6 Benefits:**
@@ -5086,7 +5097,7 @@ sudo bash bin/secure-dns-setup.sh --rollback
 ```bash
 # Disable only DNSMasq (use upstream directly)
 sudo systemctl stop dnsmasq
-# Applications will use Stubby directly on port 5353
+# Applications will use Stubby directly on port 5453
 
 # Disable only Stubby (fallback to traditional DNS)
 sudo systemctl stop stubby
@@ -5115,9 +5126,9 @@ cat /etc/resolv.conf
 nslookup google.com
 ```
 
-### Why port 5353 for Stubby?
+### Why port 5453 for Stubby?
 
-**Port 5353 is used for architectural reasons:**
+**Port 5453 is used for architectural reasons:**
 
 **Port Selection Rationale:**
 
@@ -5127,7 +5138,7 @@ nslookup google.com
 - **Privilege**: Requires root for binding
 - **Issue**: Would replace system DNS functionality
 
-**Port 5353 (IANA Registered):**
+**Port 5453 (IANA Registered):**
 - **Designated for**: DNS over TLS proxy services
 - **Non-privileged**: Can bind without root (with capability)
 - **Isolated**: Separate from system DNS operations
@@ -5135,20 +5146,20 @@ nslookup google.com
 
 **Architecture Benefits:**
 ```
-Application → DNSMasq (port 53) → Stubby (port 5353) → TLS (port 853) → Internet
+Application → DNSMasq (port 53) → Stubby (port 5453) → TLS (port 853) → Internet
                 ↑                        ↑
             System DNS              Encrypted DNS Proxy
 ```
 
 **Port Flexibility:**
 ```bash
-# If port 5353 conflicts, change it
+# If port 5453 conflicts, change it
 # Edit /etc/stubby/stubby.yml
 listen_addresses:
   - 127.0.0.1@5555  # Use custom port
 
 # Update DNSMasq to use new port
-# Edit /etc/dnsmasq.d/dns-stubby.conf
+# Edit /etc/dnsmasq.d/stubby-forward.conf
 server=127.0.0.1#5555
 ```
 
@@ -5345,8 +5356,8 @@ dig . @a.root-servers.net +dnssec
 [Timestamp] [Level] [Component] Message
 Jan 11 13:52:15 stubby[1234]: [stubby] Starting stubby version 1.4.0
 Jan 11 13:52:15 stubby[1234]: [stubby] Read 3 upstream servers
-Jan 11 13:52:16 stubby[1234]: [stubby] Opening listen sockets on 127.0.0.1 port 5353
-Jan 11 13:52:16 stubby[1234]: [stubby] Listening on 127.0.0.1 port 5353
+Jan 11 13:52:16 stubby[1234]: [stubby] Opening listen sockets on 127.0.0.1 port 5453
+Jan 11 13:52:16 stubby[1234]: [stubby] Listening on 127.0.0.1 port 5453
 Jan 11 13:52:17 stubby[1234]: [stubby] TLS connection established to 1.1.1.1
 ```
 
@@ -5355,9 +5366,9 @@ Jan 11 13:52:17 stubby[1234]: [stubby] TLS connection established to 1.1.1.1
 [Timestamp] [Level] Message
 Jan 11 13:52:16 dnsmasq[1235]: started, version 2.80 cachesize 10000
 Jan 11 13:52:16 dnsmasq[1235]: compile time options: IPv6 GNU-getopt DBus
-Jan 11 13:52:16 dnsmasq[1235]: using nameserver 127.0.0.1#5353
+Jan 11 13:52:16 dnsmasq[1235]: using nameserver 127.0.0.1#5453
 Jan 11 13:52:17 dnsmasq[1235]: query[A] google.com from 127.0.0.1
-Jan 11 13:52:17 dnsmasq[1235]: forwarded google.com to 127.0.0.1#5353
+Jan 11 13:52:17 dnsmasq[1235]: forwarded google.com to 127.0.0.1#5453
 Jan 11 13:52:18 dnsmasq[1235]: reply google.com is 142.250.185.46
 ```
 
@@ -5635,7 +5646,7 @@ SetDNScache/
 ```
 /etc/dnsmasq.conf                         # Main DNSMasq configuration
 /etc/dnsmasq.d/                          # Additional DNSMasq configurations
-├── dns-stubby.conf                      # Integration with Stubby
+├── stubby-forward.conf                      # Integration with Stubby
 ├── cache-settings.conf                  # Cache configuration
 └── local-domains.conf                   # Local DNS entries
 ```
@@ -6152,7 +6163,7 @@ dhcp-host=192.168.1.20,set:regular,regular-users
 dhcp-host=192.168.1.30,set:guest,guest-users
 
 # Different DNS policies per group
-server=/work-sites.com/127.0.0.1#5353
+server=/work-sites.com/127.0.0.1#5453
 server=/entertainment.com/9.9.9.9
 EOF
 
@@ -6218,7 +6229,7 @@ RUN apt-get update && apt-get install -y \\
 COPY bin/secure-dns-setup.sh /usr/local/bin/
 COPY config/ /etc/stubby/
 
-EXPOSE 53 5353
+EXPOSE 53 5453
 
 CMD ["/usr/local/bin/secure-dns-setup.sh"]
 ```
@@ -6233,7 +6244,7 @@ services:
     ports:
       - "53:53/udp"
       - "53:53/tcp"
-      - "5353:5353"
+      - "5453:5453"
     volumes:
       - ./config:/etc/stubby
       - ./logs:/var/log
@@ -6332,7 +6343,7 @@ nslookup cloudflare.com > /dev/null && echo "✓ Cloudflare" || echo "✗ Cloudf
 # 3. Port accessibility
 echo "3. Ports:"
 netstat -tuln | grep -q ":53" && echo "✓ Port 53" || echo "✗ Port 53"
-netstat -tuln | grep -q ":5353" && echo "✓ Port 5353" || echo "✗ Port 5353"
+netstat -tuln | grep -q ":5453" && echo "✓ Port 5453" || echo "✗ Port 5453"
 
 # 4. DNSSEC validation
 echo "4. DNSSEC:"

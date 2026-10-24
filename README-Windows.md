@@ -1,5 +1,15 @@
 # SetDNScache - Windows 11 Edition
 
+> **What changed (fix/review-issues):** `Secure-DnsSetup.ps1 -InterfaceAlias "Wi-Fi","Ethernet"`
+> selects adapters (default: all adapters that are Up). Each adapter gets 4 servers:
+> 1.1.1.1, 9.9.9.9, 1.0.0.1, 149.112.112.112 (Google is no longer set on adapters).
+> DoH entries are added with `Add-DnsClientDohServerAddress`; existing/built-in entries are
+> reused, and `-Rollback` removes only the entries this script added (recorded in the backup
+> JSON). The old NRPT/DirectAccess changes (`Set-DnsClientNrptGlobal`) were removed.
+> `Configure-EthernetDNS.ps1 -InterfaceAlias "<name>" [-NoPause]` replaces the hardcoded "Ethernet".
+> Manual `netsh dns delete encryption` commands below would also delete Windows' built-in
+> entries; prefer `-Rollback`.
+
 [![License: Unlicense](https://img.shields.io/badge/License-Unlicense-blue.svg)](LICENSE)
 [![DNS Security](https://img.shields.io/badge/DNS-Encrypted%20DoH-green.svg)](#security-considerations)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2011-blue.svg)](#system-requirements)
