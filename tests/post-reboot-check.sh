@@ -31,7 +31,7 @@ test_dns_resolution() {
     for domain in "${test_domains[@]}"; do
         if dig +short "$domain" >/dev/null 2>&1; then
             echo "✓ DNS resolution for $domain: PASS"
-            ((success_count++))
+            success_count=$((success_count + 1))
         else
             echo "✗ DNS resolution for $domain: FAIL"
         fi
@@ -47,9 +47,9 @@ test_dns_resolution() {
 # Function to check if port is listening
 check_port_listening() {
     local port=$1
-    local protocol=$2
+    # $2 (protocol) kept for call compatibility; ss checks tcp+udp
     
-    if ss -tuln | grep -q "$port"; then
+    if ss -tuln | grep -q ":$port "; then
         return 0
     else
         return 1
@@ -95,7 +95,7 @@ verify_config_files() {
     local files_to_check=(
         "/etc/resolv.conf"
         "/etc/stubby/stubby.yml"
-        "/etc/dnsmasq.d/dns-stubby.conf"
+        "/etc/dnsmasq.d/stubby-forward.conf"
     )
     
     local all_good=true
@@ -160,8 +160,10 @@ check_symlinks() {
 measure_startup_time() {
     echo "Measuring service startup time..."
     
-    local stubby_startup=$(systemctl show stubby --property=ExecMainStartTimestamp,ExecMainExitTimestamp --value 2>/dev/null || echo "N/A")
-    local dnsmasq_startup=$(systemctl show dnsmasq --property=ExecMainStartTimestamp,ExecMainExitTimestamp --value 2>/dev/null || echo "N/A")
+    local stubby_startup
+    stubby_startup=$(systemctl show stubby --property=ExecMainStartTimestamp,ExecMainExitTimestamp --value 2>/dev/null || echo "N/A")
+    local dnsmasq_startup
+    dnsmasq_startup=$(systemctl show dnsmasq --property=ExecMainStartTimestamp,ExecMainExitTimestamp --value 2>/dev/null || echo "N/A")
     
     echo "Stubby startup: $stubby_startup"
     echo "DNSMasq startup: $dnsmasq_startup"
@@ -231,7 +233,9 @@ provide_remediation() {
     if [ -f "/etc/resolv.conf" ] && ! grep -q "127.0.0.1" "/etc/resolv.conf"; then
         echo "3. /etc/resolv.conf not pointing to localhost:"
         echo "   - Check current content: cat /etc/resolv.conf"
-        echo "   - Fix with: echo 'nameserver 127.0.0.1' | sudo tee /etc/resolv.conf"
+        echo "   - Do NOT overwrite /etc/resolv.conf by hand (systemd-resolved/NetworkManager will replace it)"
+        echo "   - Re-run: sudo bin/secure-dns-setup.sh  (installs /etc/systemd/resolved.conf.d/setdnscache.conf)"
+        echo "   - Check: resolvectl status; ls -l /etc/resolv.conf"
         echo ""
     fi
     
@@ -255,17 +259,15 @@ main() {
     # Check if we have a pre-reboot log to compare with
     if [ -f "$JSON_REPORT" ]; then
         # Append to existing JSON report
-        local action="append"
         echo '  },' >> "$JSON_REPORT"
         echo '  "post_reboot_test": {' >> "$JSON_REPORT"
-        echo '    "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'",' >> "$JSON_REPORT"
+        echo '    "timestamp": "'"$(date '+%Y-%m-%d %H:%M:%S')"'",' >> "$JSON_REPORT"
         echo '    "tests": [' >> "$JSON_REPORT"
     else
         # Create new JSON report
-        local action="new"
         echo '{' > "$JSON_REPORT"
         echo '  "post_reboot_test": {' >> "$JSON_REPORT"
-        echo '    "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'",' >> "$JSON_REPORT"
+        echo '    "timestamp": "'"$(date '+%Y-%m-%d %H:%M:%S')"'",' >> "$JSON_REPORT"
         echo '    "tests": [' >> "$JSON_REPORT"
     fi
     
@@ -277,22 +279,22 @@ main() {
     echo "${YELLOW}Test 1: Stubby Service Auto-Start Verification${NC}"
     if verify_service "stubby" "Stubby"; then
         echo '      {"test": "stubby_auto_start", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo '      {"test": "stubby_auto_start", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 2: Verify DNSMasq service started automatically
     echo ""
     echo "${YELLOW}Test 2: DNSMasq Service Auto-Start Verification${NC}"
     if verify_service "dnsmasq" "DNSMasq"; then
         echo '      {"test": "dnsmasq_auto_start", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo '      {"test": "dnsmasq_auto_start", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 3: Verify /etc/resolv.conf still points to 127.0.0.1
     echo ""
@@ -300,12 +302,12 @@ main() {
     if [ -f "/etc/resolv.conf" ] && grep -q "127.0.0.1" "/etc/resolv.conf"; then
         echo "✓ /etc/resolv.conf points to 127.0.0.1: PASS"
         echo '      {"test": "resolv_conf_persistence", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo "✗ /etc/resolv.conf points to 127.0.0.1: FAIL"
         echo '      {"test": "resolv_conf_persistence", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 4: Verify stubby.yml configuration is intact
     echo ""
@@ -313,36 +315,36 @@ main() {
     if [ -f "/etc/stubby/stubby.yml" ] && [ -r "/etc/stubby/stubby.yml" ]; then
         echo "✓ /etc/stubby/stubby.yml configuration intact: PASS"
         echo '      {"test": "stubby_config_integrity", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo "✗ /etc/stubby/stubby.yml configuration intact: FAIL"
         echo '      {"test": "stubby_config_integrity", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
-    # Test 5: Verify dns-stubby.conf configuration is intact
+    # Test 5: Verify stubby-forward.conf configuration is intact
     echo ""
     echo "${YELLOW}Test 5: DNSMasq Configuration File Integrity${NC}"
-    if [ -f "/etc/dnsmasq.d/dns-stubby.conf" ] && [ -r "/etc/dnsmasq.d/dns-stubby.conf" ]; then
-        echo "✓ /etc/dnsmasq.d/dns-stubby.conf configuration intact: PASS"
+    if [ -f "/etc/dnsmasq.d/stubby-forward.conf" ] && [ -r "/etc/dnsmasq.d/stubby-forward.conf" ]; then
+        echo "✓ /etc/dnsmasq.d/stubby-forward.conf configuration intact: PASS"
         echo '      {"test": "dnsmasq_config_integrity", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
-        echo "✗ /etc/dnsmasq.d/dns-stubby.conf configuration intact: FAIL"
+        echo "✗ /etc/dnsmasq.d/stubby-forward.conf configuration intact: FAIL"
         echo '      {"test": "dnsmasq_config_integrity", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 6: DNS resolution test after reboot
     echo ""
     echo "${YELLOW}Test 6: Post-Reboot DNS Resolution Test${NC}"
     if test_dns_resolution; then
         echo '      {"test": "post_reboot_dns_resolution", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo '      {"test": "post_reboot_dns_resolution", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 7: Verify port 53 listening after reboot
     echo ""
@@ -350,47 +352,47 @@ main() {
     if check_port_listening "53" "tcp"; then
         echo "✓ Port 53 is listening: PASS"
         echo '      {"test": "port_53_post_reboot", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo "✗ Port 53 is listening: FAIL"
         echo '      {"test": "port_53_post_reboot", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
-    # Test 8: Verify port 5353 listening after reboot
+    # Test 8: Verify port 5453 listening after reboot
     echo ""
-    echo "${YELLOW}Test 8: Port 5353 Listening After Reboot${NC}"
-    if check_port_listening "5353" "tcp"; then
-        echo "✓ Port 5353 is listening: PASS"
-        echo '      {"test": "port_5353_post_reboot", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+    echo "${YELLOW}Test 8: Port 5453 Listening After Reboot${NC}"
+    if check_port_listening "5453" "tcp"; then
+        echo "✓ Port 5453 is listening: PASS"
+        echo '      {"test": "port_5453_post_reboot", "status": "PASS"},' >> "$JSON_REPORT"
+        pass_count=$((pass_count + 1))
     else
-        echo "✗ Port 5353 is listening: FAIL"
-        echo '      {"test": "port_5353_post_reboot", "status": "FAIL"},' >> "$JSON_REPORT"
+        echo "✗ Port 5453 is listening: FAIL"
+        echo '      {"test": "port_5453_post_reboot", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 9: Measure startup time
     echo ""
     echo "${YELLOW}Test 9: Service Startup Time Measurement${NC}"
     if measure_startup_time; then
         echo '      {"test": "startup_time_measurement", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo '      {"test": "startup_time_measurement", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 10: Compare with pre-reboot state
     echo ""
     echo "${YELLOW}Test 10: Pre-Reboot State Comparison${NC}"
     if compare_with_preboot; then
         echo '      {"test": "pre_reboot_comparison", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo '      {"test": "pre_reboot_comparison", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 11: DNSSEC persistence check (final test - no trailing comma)
     echo ""
@@ -398,12 +400,12 @@ main() {
     if dig +dnssec cloudflare.com | grep -q "ad;"; then
         echo "✓ DNSSEC validation still working: PASS"
         echo '      {"test": "dnssec_persistence", "status": "PASS"}' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo "✗ DNSSEC validation failed: FAIL"
         echo '      {"test": "dnssec_persistence", "status": "FAIL"}' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Close JSON array and object
     echo '    ],' >> "$JSON_REPORT"

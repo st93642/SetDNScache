@@ -41,9 +41,10 @@ display_header() {
 display_spinner() {
     local pid=$1
     local delay=0.1
+    # shellcheck disable=SC1003  # literal backslash is intended
     local spinstr='|/-\'
     
-    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+    while kill -0 "$pid" 2>/dev/null; do
         local temp=${spinstr#?}
         printf "  [%c]  " "$spinstr"
         local spinstr=$temp${spinstr%"$temp"}
@@ -81,7 +82,7 @@ display_checklist() {
     echo "  ✓ Stubby service is running and enabled"
     echo "  ✓ DNSMasq service is running and enabled"
     echo "  ✓ Port 53 is listening"
-    echo "  ✓ Port 5353 is listening"
+    echo "  ✓ Port 5453 is listening"
     echo "  ✓ Configuration files exist and are readable"
     echo "  ✓ DNS resolution is working"
     echo "  ✓ No broken symlinks in /etc/"
@@ -139,8 +140,10 @@ generate_comparison_report() {
             echo ""
             
             # Check if all tests passed
-            local pre_failed=$(grep -A 3 '"pre_reboot_test"' "$JSON_REPORT" | grep '"failed_tests"' | sed 's/.*: //;s/[",]//g')
-            local post_failed=$(grep -A 3 '"post_reboot_test"' "$JSON_REPORT" | grep '"failed_tests"' | sed 's/.*: //;s/[",]//g')
+            local pre_failed
+            pre_failed=$(grep -A 3 '"pre_reboot_test"' "$JSON_REPORT" | grep '"failed_tests"' | sed 's/.*: //;s/[",]//g' || true)
+            local post_failed
+            post_failed=$(grep -A 3 '"post_reboot_test"' "$JSON_REPORT" | grep '"failed_tests"' | sed 's/.*: //;s/[",]//g' || true)
             
             if [ "$pre_failed" = "0" ] && [ "$post_failed" = "0" ]; then
                 echo "${GREEN}✓ All tests passed! DNS configuration successfully persisted across reboot.${NC}"

@@ -30,7 +30,7 @@ test_dns_resolution() {
     for domain in "${test_domains[@]}"; do
         if dig +short "$domain" >/dev/null 2>&1; then
             echo "✓ DNS resolution for $domain: PASS"
-            ((success_count++))
+            success_count=$((success_count + 1))
         else
             echo "✗ DNS resolution for $domain: FAIL"
         fi
@@ -46,9 +46,9 @@ test_dns_resolution() {
 # Function to check if port is listening
 check_port_listening() {
     local port=$1
-    local protocol=$2
+    # $2 (protocol) kept for call compatibility; ss checks tcp+udp
     
-    if ss -tuln | grep -q "$port"; then
+    if ss -tuln | grep -q ":$port "; then
         return 0
     else
         return 1
@@ -94,7 +94,7 @@ verify_config_files() {
     local files_to_check=(
         "/etc/resolv.conf"
         "/etc/stubby/stubby.yml"
-        "/etc/dnsmasq.d/dns-stubby.conf"
+        "/etc/dnsmasq.d/stubby-forward.conf"
     )
     
     local all_good=true
@@ -183,7 +183,7 @@ main() {
     # Initialize JSON report
     echo '{' > "$JSON_REPORT"
     echo '  "pre_reboot_test": {' >> "$JSON_REPORT"
-    echo '    "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'",' >> "$JSON_REPORT"
+    echo '    "timestamp": "'"$(date '+%Y-%m-%d %H:%M:%S')"'",' >> "$JSON_REPORT"
     echo '    "tests": [' >> "$JSON_REPORT"
     
     local test_count=0
@@ -194,22 +194,22 @@ main() {
     echo "${YELLOW}Test 1: Stubby Service Verification${NC}"
     if verify_service "stubby" "Stubby"; then
         echo '      {"test": "stubby_service", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo '      {"test": "stubby_service", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 2: Verify DNSMasq service
     echo ""
     echo "${YELLOW}Test 2: DNSMasq Service Verification${NC}"
     if verify_service "dnsmasq" "DNSMasq"; then
         echo '      {"test": "dnsmasq_service", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo '      {"test": "dnsmasq_service", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 3: Verify port 53 listening
     echo ""
@@ -217,58 +217,58 @@ main() {
     if check_port_listening "53" "tcp"; then
         echo "✓ Port 53 is listening: PASS"
         echo '      {"test": "port_53_listening", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo "✗ Port 53 is listening: FAIL"
         echo '      {"test": "port_53_listening", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
-    # Test 4: Verify port 5353 listening
+    # Test 4: Verify port 5453 listening
     echo ""
-    echo "${YELLOW}Test 4: Port 5353 Listening Check${NC}"
-    if check_port_listening "5353" "tcp"; then
-        echo "✓ Port 5353 is listening: PASS"
-        echo '      {"test": "port_5353_listening", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+    echo "${YELLOW}Test 4: Port 5453 Listening Check${NC}"
+    if check_port_listening "5453" "tcp"; then
+        echo "✓ Port 5453 is listening: PASS"
+        echo '      {"test": "port_5453_listening", "status": "PASS"},' >> "$JSON_REPORT"
+        pass_count=$((pass_count + 1))
     else
-        echo "✗ Port 5353 is listening: FAIL"
-        echo '      {"test": "port_5353_listening", "status": "FAIL"},' >> "$JSON_REPORT"
+        echo "✗ Port 5453 is listening: FAIL"
+        echo '      {"test": "port_5453_listening", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 5: Verify configuration files
     echo ""
     echo "${YELLOW}Test 5: Configuration Files Verification${NC}"
     if verify_config_files; then
         echo '      {"test": "configuration_files", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo '      {"test": "configuration_files", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 6: DNS resolution test
     echo ""
     echo "${YELLOW}Test 6: DNS Resolution Test${NC}"
     if test_dns_resolution; then
         echo '      {"test": "dns_resolution", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo '      {"test": "dns_resolution", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 7: Check symlink integrity
     echo ""
     echo "${YELLOW}Test 7: Symlink Integrity Check${NC}"
     if check_symlinks; then
         echo '      {"test": "symlink_integrity", "status": "PASS"},' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo '      {"test": "symlink_integrity", "status": "FAIL"},' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Test 8: DNSSEC validation (final test - no trailing comma)
     echo ""
@@ -276,12 +276,12 @@ main() {
     if dig +dnssec cloudflare.com | grep -q "ad;"; then
         echo "✓ DNSSEC validation: PASS"
         echo '      {"test": "dnssec_validation", "status": "PASS"}' >> "$JSON_REPORT"
-        ((pass_count++))
+        pass_count=$((pass_count + 1))
     else
         echo "✗ DNSSEC validation: FAIL"
         echo '      {"test": "dnssec_validation", "status": "FAIL"}' >> "$JSON_REPORT"
     fi
-    ((test_count++))
+    test_count=$((test_count + 1))
     
     # Close JSON array and object
     echo '    ],' >> "$JSON_REPORT"
