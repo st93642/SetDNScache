@@ -215,11 +215,14 @@ case "$*" in
   "-g GENERAL.DEVICES connection show "*) echo eth0 ;;
   "connection modify "*) u="$3"; echo "$5" > "$db/$u.v4"; echo "$7" > "$db/$u.v6" ;;
   "device reapply "*) ;;
+  "connection up "*) [ -n "${NM_UP_FAIL:-}" ] && exit 1; [ -n "${STALE_AFTER_UP:-}" ] && echo "Link 2 (eth0): fe80::1%2" > "$RESOLVECTL_DNS"; exit 0 ;;
+  "-t -f DEVICE,TYPE device status") printf 'eth0:ethernet\nlo:loopback\n' ;;
 esac
 FAKE
 cat > "$TMP/bin/resolvectl" <<'FAKE'
 #!/bin/bash
-case "$1" in status) exit 0;; dns) cat "$RESOLVECTL_DNS";; esac
+echo "$*" >> "$NM_LOG"
+case "$1" in status) exit 0;; dns) cat "$RESOLVECTL_DNS";; revert) echo "Link 2 (eth0):" > "$RESOLVECTL_DNS";; esac
 FAKE
 chmod +x "$TMP/bin/nmcli" "$TMP/bin/resolvectl"
 export ACTIVE_SVCS=systemd-resolved NM_DB="$TMP/nm" NM_LOG="$TMP/nm.log" RESOLVECTL_DNS="$TMP/rdns" RESOLV_CONF="$TMP/etc/resolv.conf" RESOLVED_STUB_RESOLV="$TMP/run/stub-resolv.conf"
@@ -243,7 +246,8 @@ check "ethernet ignores DHCP DNS v4+v6" '[ "$(cat "$NM_DB/u-eth.v4")$(cat "$NM_D
 check "wifi partially set gets v6 too" '[ "$(cat "$NM_DB/u-wifi.v6")" = yes ]'
 check "VPN connection untouched" '[ "$(cat "$NM_DB/u-vpn.v4")" = no ] && ! grep -q "modify u-vpn" "$NM_LOG"'
 check "NM originals recorded in state" 'grep -qx "nm=u-eth|no|no" "$STATE_DIR/state" && grep -qx "nm=u-wifi|yes|no" "$STATE_DIR/state"'
-check "device reapplied" 'grep -q "device reapply eth0" "$NM_LOG"'
+check "connection brought up (not just reapply)" 'grep -q "connection up u-eth" "$NM_LOG" && ! grep -q "device reapply" "$NM_LOG"'
+check "resolved caches flushed" 'grep -q "^flush-caches" "$NM_LOG"'
 nb=$(find "$STATE_DIR/backups" -type f -o -type l | wc -l); ns=$(wc -l < "$STATE_DIR/state")
 : > "$NM_LOG"; sleep 1
 bash -c "$RUN2" >/dev/null 2>&1 || true
@@ -283,6 +287,17 @@ dt() { PATH="$TMP/digbin:$PATH" bash -c 'source "'"$SCRIPT"'"; test_dnssec_valid
 check "DNSSEC passes: AD set + bogus SERVFAIL" 'dt'
 check "DNSSEC fails without AD flag" '! AD_FLAG="" dt'
 check "DNSSEC fails when bogus domain resolves" '! BOGUS_STATUS=NOERROR dt'
+
+# 13. Stale link DNS after reconnect is reverted; up-failure falls back to reapply
+reset_nm; setup_tree; : > "$RESOLVECTL_DNS"
+STALE_AFTER_UP=1 bash -c "$RUN2" >/dev/null 2>&1 || true
+check "stale link DNS -> resolvectl revert eth0" 'grep -q "^revert eth0" "$NM_LOG" && ! grep -q fe80 "$RESOLVECTL_DNS"'
+reset_nm; setup_tree; : > "$RESOLVECTL_DNS"
+NM_UP_FAIL=1 bash -c "$RUN2" >/dev/null 2>&1 || true
+check "connection up failure falls back to device reapply" 'grep -q "device reapply eth0" "$NM_LOG"'
+check "no revert when links are clean" '! grep -q "^revert" "$NM_LOG"'
+: > "$NM_LOG"; bash -c 'source "'"$SCRIPT"'"; check_root() { :; }; rollback' >/dev/null 2>&1
+check "rollback: connection up + flush, no revert" 'grep -q "connection up u-eth" "$NM_LOG" && grep -q "^flush-caches" "$NM_LOG" && ! grep -q "^revert" "$NM_LOG"'
 
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]

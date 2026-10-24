@@ -441,11 +441,46 @@ nm_available() {
     command -v nmcli &>/dev/null && nmcli -t general status &>/dev/null
 }
 
+# Re-activate a connection so changed DNS settings really apply.
+# "device reapply" can leave stale RA (IPv6) DNS on the resolved link, so
+# prefer "connection up"; fall back to reapply. Prints the device name.
 nm_reapply() {
     local uuid="$1" dev
     dev=$(nmcli -g GENERAL.DEVICES connection show "$uuid" 2>/dev/null || true)
     [ -n "$dev" ] || return 0
-    run nmcli device reapply "$dev" || log WARN "could not reapply $dev; reconnect it to apply DNS changes"
+    run nmcli connection up "$uuid" >&2 \
+        || run nmcli device reapply "$dev" >&2 \
+        || log WARN "could not re-activate $dev; reconnect it to apply DNS changes" >&2
+    echo "$dev"
+}
+
+# Non-local DNS servers resolved currently has on IFACE (empty = clean).
+link_nonlocal_dns() {
+    resolvectl dns "$1" 2>/dev/null | awk -F': ' 'NF>1{n=split($2,a," "); for(i=1;i<=n;i++) if(a[i]!="127.0.0.1" && a[i]!="::1") print a[i]}'
+}
+
+# After NM changes: flush caches; on leak_check=yes, revert links that still
+# carry stale per-link DNS so nothing bypasses 127.0.0.1.
+resolved_refresh_links() {
+    local leak_check="$1"; shift
+    command -v resolvectl &>/dev/null || return 0
+    run resolvectl flush-caches || true
+    [ "$leak_check" = yes ] || return 0
+    local dev stale
+    for dev in "$@"; do
+        [ "$DRY_RUN" = true ] && { log INFO "[DRY RUN] would check $dev for stale link DNS (resolvectl revert $dev if needed)"; continue; }
+        stale=$(link_nonlocal_dns "$dev")
+        [ -n "$stale" ] || continue
+        log WARN "$dev still has stale link DNS ($(echo "$stale" | xargs)); reverting link"
+        run resolvectl revert "$dev" || true
+        run resolvectl flush-caches || true
+        stale=$(link_nonlocal_dns "$dev")
+        if [ -n "$stale" ]; then
+            log WARN "$dev still lists $(echo "$stale" | xargs); a reconnect or reboot will clear it"
+        else
+            log INFO "$dev: stale link DNS cleared"
+        fi
+    done
 }
 
 configure_networkmanager_dns() {
@@ -453,7 +488,8 @@ configure_networkmanager_dns() {
         log INFO "NetworkManager not running; no per-connection DNS to disable"
         return 0
     fi
-    local uuid type name v4 v6 changed=0
+    local uuid type name v4 v6 changed=0 dev
+    local -a devs=()
     while IFS=: read -r uuid type name; do
         [ -n "$uuid" ] || continue
         case " $NM_DNS_TYPES " in *" $type "*) ;; *) continue ;; esac
@@ -466,13 +502,20 @@ configure_networkmanager_dns() {
         state_add "nm=$uuid|${v4:-no}|${v6:-no}"
         run nmcli connection modify "$uuid" ipv4.ignore-auto-dns yes ipv6.ignore-auto-dns yes
         [ "$DRY_RUN" = true ] || log INFO "NM connection '$name': ignoring DHCP/RA DNS servers"
-        nm_reapply "$uuid"
+        dev=$(nm_reapply "$uuid")
+        [ -z "$dev" ] || devs+=("$dev")
         changed=$((changed + 1))
         local static
         static=$(nmcli -g ipv4.dns,ipv6.dns connection show "$uuid" 2>/dev/null | tr '\n' ' ' | xargs || true)
         [ -z "$static" ] || log WARN "NM connection '$name' has static DNS ($static); remove it to avoid leaks"
     done < <(nmcli -t -f UUID,TYPE,NAME connection show 2>/dev/null)
     [ "$changed" -gt 0 ] || log INFO "NetworkManager connections already ignore DHCP/RA DNS"
+    # Also re-check active devices on reruns (stale DNS from an earlier run).
+    while IFS=: read -r dev type; do
+        case " $NM_DNS_TYPES ethernet wifi " in *" $type "*) ;; *) continue ;; esac
+        [[ " ${devs[*]} " == *" $dev "* ]] || devs+=("$dev")
+    done < <(nmcli -t -f DEVICE,TYPE device status 2>/dev/null | grep -v ':loopback$' || true)
+    resolved_refresh_links yes "${devs[@]}"
 }
 
 restore_nm_connection() {
@@ -484,7 +527,8 @@ restore_nm_connection() {
     run nmcli connection modify "$uuid" ipv4.ignore-auto-dns "$v4" ipv6.ignore-auto-dns "$v6" \
         || { log WARN "could not restore NM connection $uuid (deleted?)"; return 0; }
     [ "$DRY_RUN" = true ] || log INFO "Restored NM connection $uuid (ignore-auto-dns v4=$v4 v6=$v6)"
-    nm_reapply "$uuid"
+    nm_reapply "$uuid" >/dev/null
+    resolved_refresh_links no
 }
 
 configure_system_resolver() {
@@ -509,8 +553,10 @@ RESOLVED_EOF
             run ln -sfn "$RESOLVED_STUB_RESOLV" "$RESOLV_CONF"
             [ "$DRY_RUN" = true ] || log INFO "Linked $RESOLV_CONF -> $RESOLVED_STUB_RESOLV"
         fi
-        configure_networkmanager_dns
+        # Restart resolved first, then change NM, so NM's (now empty) link DNS
+        # is the last thing pushed to resolved.
         run systemctl restart "$RESOLVED_SERVICE"
+        configure_networkmanager_dns
     else
         log WARN "systemd-resolved not active; writing $RESOLV_CONF directly"
         backup_config "$RESOLV_CONF"
