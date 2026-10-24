@@ -1,36 +1,41 @@
 #!/bin/bash
 #
 # Secure DNS Configuration Script for SetDNScache
-# Configures Stubby with DNS-over-TLS and DNSSEC validation
+# Configures Stubby with DNS-over-TLS (authenticated by certificate name)
+# behind a dnsmasq cache, and points systemd-resolved at it.
 # Primary: Cloudflare | Secondary: Quad9 | Tertiary: Google
 #
 # Usage: sudo ./secure-dns-setup.sh [--run-tests] [--test-reboot] [--rollback]
+#                                   [--dry-run] [--yes] [--verbose] [--help]
 #
 
 set -euo pipefail
 
 # ============================================================================
-# Configuration
+# Configuration (paths can be overridden via environment, e.g. for testing)
 # ============================================================================
 
-STUBBY_CONFIG="/etc/stubby/stubby.yml"
+STUBBY_CONFIG="${STUBBY_CONFIG:-/etc/stubby/stubby.yml}"
 STUBBY_SERVICE="stubby"
 DNSMASQ_SERVICE="dnsmasq"
-DNSMASQ_CONFIG="/etc/dnsmasq.conf"
-DNSMASQ_D="/etc/dnsmasq.d/"
-STUBBY_PORT=5353
+DNSMASQ_D="${DNSMASQ_D:-/etc/dnsmasq.d}"
+DNSMASQ_DROPIN="$DNSMASQ_D/stubby-forward.conf"
+RESOLVED_SERVICE="systemd-resolved"
+RESOLVED_DROPIN_DIR="${RESOLVED_DROPIN_DIR:-/etc/systemd/resolved.conf.d}"
+RESOLVED_DROPIN="$RESOLVED_DROPIN_DIR/setdnscache.conf"
+STATE_DIR="${STATE_DIR:-/var/lib/setdnscache}"
+STATE_FILE="$STATE_DIR/state"
+# 5353 is mDNS (avahi-daemon) on most desktops, so use 5453 for Stubby.
+STUBBY_PORT="${STUBBY_PORT:-5453}"
 DNS_PORT=53
-TEST_LOG=""
 VERBOSE=false
 DRY_RUN=false
-RUN_TESTS_ONLY=false
+ASSUME_YES=false
+ACTION="configure"
 
 # DNS Server Configuration
-# PRIMARY: Cloudflare (1.1.1.1, 1.0.0.1)
 CLOUDFLARE_PRIMARY=("1.1.1.1" "1.0.0.1")
-# SECONDARY: Quad9 (9.9.9.9, 149.112.112.112)
 QUAD9_SECONDARY=("9.9.9.9" "149.112.112.112")
-# TERTIARY: Google (8.8.8.8, 8.8.4.4)
 GOOGLE_TERTIARY=("8.8.8.8" "8.8.4.4")
 
 # TLS Port for Stubby
@@ -43,28 +48,19 @@ STUBBY_TLS_PORT=853
 log() {
     local level="$1"
     shift
-    local message="$*"
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    
+
     case "$level" in
-        INFO)
-            echo -e "\033[32m[INFO]\033[0m $timestamp - $*"
-            ;;
-        WARN)
-            echo -e "\033[33m[WARN]\033[0m $timestamp - $*"
-            ;;
-        ERROR)
-            echo -e "\033[31m[ERROR]\033[0m $timestamp - $*" >&2
-            ;;
+        INFO)  echo -e "\033[32m[INFO]\033[0m $timestamp - $*" ;;
+        WARN)  echo -e "\033[33m[WARN]\033[0m $timestamp - $*" ;;
+        ERROR) echo -e "\033[31m[ERROR]\033[0m $timestamp - $*" >&2 ;;
         DEBUG)
             if [ "$VERBOSE" = true ]; then
                 echo -e "\033[36m[DEBUG]\033[0m $timestamp - $*"
             fi
             ;;
-        *)
-            echo "[$level] $timestamp - $*"
-            ;;
+        *)     echo "[$level] $timestamp - $*" ;;
     esac
 }
 
@@ -76,195 +72,204 @@ log_section() {
 }
 
 # ============================================================================
+# Side-effect wrappers (every change to the system goes through these so
+# --dry-run is honoured everywhere)
+# ============================================================================
+
+run() {
+    if [ "$DRY_RUN" = true ]; then
+        log INFO "[DRY RUN] would run: $*"
+        return 0
+    fi
+    log DEBUG "run: $*"
+    "$@"
+}
+
+# write_file PATH MODE < content
+write_file() {
+    local path="$1" mode="$2" content
+    content=$(cat)
+    if [ "$DRY_RUN" = true ]; then
+        log INFO "[DRY RUN] would write $path (mode $mode):"
+        printf '%s\n' "$content" | sed 's/^/    | /'
+        return 0
+    fi
+    mkdir -p "$(dirname "$path")"
+    printf '%s\n' "$content" > "$path"
+    chmod "$mode" "$path"
+    log INFO "Wrote $path"
+}
+
+state_add() {
+    # Append a "key=value" record to the state file
+    if [ "$DRY_RUN" = true ]; then
+        log DEBUG "[DRY RUN] state: $*"
+        return 0
+    fi
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    printf '%s\n' "$*" >> "$STATE_FILE"
+}
+
+# ============================================================================
 # Pre-flight Checks
 # ============================================================================
 
 check_root() {
+    if [ "$DRY_RUN" = true ]; then
+        log DEBUG "Dry run: root not required"
+        return 0
+    fi
     if [ "$EUID" -ne 0 ]; then
         log ERROR "This script must be run as root (use sudo)"
-        log INFO "Usage: sudo $0 [--run-tests] [--test-reboot] [--rollback]"
+        log INFO "Usage: sudo $0 [--run-tests] [--test-reboot] [--rollback] [--dry-run]"
         exit 1
     fi
 }
 
-check_dependencies() {
-    log INFO "Checking required dependencies..."
-    
-    local missing_deps=()
-    
-    for cmd in stubby dnsmasq dig nslookup systemctl; do
-        if ! command -v "$cmd" &> /dev/null; then
-            missing_deps+=("$cmd")
-        fi
-    done
-    
-    if [ ${#missing_deps[@]} -gt 0 ]; then
-        log WARN "Missing dependencies: ${missing_deps[*]}"
-        log INFO "Installing missing packages on Debian/Ubuntu..."
-        apt-get update -qq
-        apt-get install -y -qq stubby dnsmasq dnsutils 2>/dev/null || {
-            log ERROR "Failed to install dependencies. Please install manually:"
-            log INFO "  apt-get install stubby dnsmasq dnsutils"
-            exit 1
-        }
+confirm() {
+    local prompt="$1" answer
+    if [ "$ASSUME_YES" = true ]; then
+        return 0
     fi
-    
-    log INFO "All dependencies satisfied"
-}
-
-detect_systemd() {
-    if ! command -v systemctl &> /dev/null; then
-        log WARN "systemd not detected - some features may not work"
+    if [ ! -t 0 ]; then
+        log ERROR "$prompt - no terminal to ask; re-run with --yes to accept"
         return 1
     fi
-    return 0
+    read -r -p "$prompt [y/N] " answer
+    [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+check_dependencies() {
+    log INFO "Checking required dependencies..."
+
+    local missing_cmds=() packages=()
+    local cmd
+    for cmd in stubby dnsmasq dig systemctl; do
+        if ! command -v "$cmd" &> /dev/null; then
+            missing_cmds+=("$cmd")
+            case "$cmd" in
+                stubby)  packages+=("stubby") ;;
+                dnsmasq) packages+=("dnsmasq") ;;
+                dig)     packages+=("dnsutils") ;;
+                systemctl) ;;  # not installable here
+            esac
+        fi
+    done
+    if ! command -v ss &>/dev/null && ! command -v netstat &>/dev/null; then
+        missing_cmds+=("ss/netstat")
+        packages+=("iproute2")
+    fi
+
+    if [ ${#missing_cmds[@]} -eq 0 ]; then
+        log INFO "All dependencies satisfied"
+        return 0
+    fi
+
+    log WARN "Missing commands: ${missing_cmds[*]}"
+    if [ ${#packages[@]} -eq 0 ]; then
+        log ERROR "systemd is required and cannot be installed by this script"
+        return 1
+    fi
+    if ! command -v apt-get &>/dev/null; then
+        log ERROR "apt-get not found. Please install manually: ${packages[*]}"
+        return 1
+    fi
+    if [ "$DRY_RUN" = true ]; then
+        log INFO "[DRY RUN] would run: apt-get install -y ${packages[*]}"
+        return 0
+    fi
+    if ! confirm "Install missing packages (${packages[*]}) with apt-get?"; then
+        log ERROR "Dependencies missing. Install manually: apt-get install ${packages[*]}"
+        return 1
+    fi
+    if ! { apt-get update -qq && apt-get install -y "${packages[@]}"; }; then
+        log ERROR "Failed to install dependencies (see apt output above)."
+        return 1
+    fi
+    log INFO "Dependencies installed"
 }
 
 # ============================================================================
-# Configuration Backup and Restore
+# Backup, state and rollback helpers
 # ============================================================================
 
+# Back up FILE (if it exists) and record it in the state file. Backups are kept.
 backup_config() {
-    local file="$1"
-    local backup="${file}.bak.$(date +%Y%m%d%H%M%S)"
-    
-    if [ -f "$file" ]; then
-        cp "$file" "$backup"
+    local file="$1" backup
+    backup="${file}.bak.$(date +%Y%m%d%H%M%S)"
+    if [ -e "$file" ] || [ -L "$file" ]; then
+        run cp -a "$file" "$backup"
+        state_add "backup=$file|$backup"
         log INFO "Backed up $file -> $backup"
-        echo "$backup"
+    else
+        state_add "created=$file"
     fi
 }
 
-restore_backup() {
-    local backup="$1"
-    local original="${backup%.bak.*}"
-    
-    if [ -f "$backup" ]; then
-        cp "$backup" "$original"
-        rm "$backup"
-        log INFO "Restored $backup -> $original"
-    fi
+record_service_state() {
+    local svc="$1" enabled active
+    enabled=$(systemctl is-enabled "$svc" 2>/dev/null || true)
+    active=$(systemctl is-active "$svc" 2>/dev/null || true)
+    state_add "service=$svc|${enabled:-unknown}|${active:-unknown}"
 }
 
 # ============================================================================
 # Stubby Configuration
 # ============================================================================
 
+# Upstreams are authenticated by TLS certificate name (tls_auth_name) against
+# the system CA store. No SPKI pins are used: pins rotate with the providers'
+# certificates and a stale pin makes GETDNS_AUTHENTICATION_REQUIRED reject the
+# server outright.
+stubby_upstream() {
+    local addr="$1" name="$2"
+    cat << UPSTREAM
+  - address_data: $addr
+    tls_port: $STUBBY_TLS_PORT
+    tls_auth_name: "$name"
+UPSTREAM
+}
+
 generate_stubby_config() {
     log INFO "Generating Stubby configuration..."
-    
-    # Ensure directory exists
-    mkdir -p "$(dirname "$STUBBY_CONFIG")"
-    
-    local config_content
-    config_content=$(cat << STUBBY_EOF
+    {
+        cat << STUBBY_EOF
 # Stubby configuration generated by SetDNScache
 # $(date '+%Y-%m-%d %H:%M:%S')
 #
-# DNS Server Hierarchy:
-#   PRIMARY:   Cloudflare (1.1.1.1, 1.0.0.1)
-#   SECONDARY: Quad9 (9.9.9.9, 149.112.112.112)
-#   TERTIARY:  Google (8.8.8.8, 8.8.4.4)
+# DNS Server Hierarchy (tried in order, round robin disabled):
+#   PRIMARY:   Cloudflare (${CLOUDFLARE_PRIMARY[*]})
+#   SECONDARY: Quad9 (${QUAD9_SECONDARY[*]})
+#   TERTIARY:  Google (${GOOGLE_TERTIARY[*]})
 #
-# All servers use DNS-over-TLS with DNSSEC validation
-
-resolution_mode: GETDNS_RESOLUTION_STUB
-round_robin_upstreams: 1
+# All servers use DNS-over-TLS, authenticated by certificate name.
 
 dns_transport_list:
   - GETDNS_TRANSPORT_TLS
-
 tls_authentication: GETDNS_AUTHENTICATION_REQUIRED
-
 tls_query_padding_blocksize: 128
-
-edns_client_subnet_private: 0
-
+edns_client_subnet_private: 1
+round_robin_upstreams: 0
 idle_timeout: 10000
+timeout: 2000
 
 listen_addresses:
   - 127.0.0.1@$STUBBY_PORT
-  - ::1@$STUBBY_PORT
+  - 0::1@$STUBBY_PORT
 
 upstream_recursive_servers:
-
-  # PRIMARY: Cloudflare DNS-over-TLS
-  # Highly reliable, DNSSEC validated, privacy-focused
-  - address_data: ${CLOUDFLARE_PRIMARY[0]}
-    tls_port: $STUBBY_TLS_PORT
-    tls_auth_name: "cloudflare-dns.com"
-    tls_pubkey_pinset:
-      - digest: "sha256"
-        data: "yioMt9IcQvI8L2wB4rI4Wz9B3Z2x8m7n5p1q4r2s6t8u0v1w3x5y7z9A0b1c2"
-    tls_connection_pool_size: 5
-    priority: 1
-
-  - address_data: ${CLOUDFLARE_PRIMARY[1]}
-    tls_port: $STUBBY_TLS_PORT
-    tls_auth_name: "cloudflare-dns.com"
-    tls_pubkey_pinset:
-      - digest: "sha256"
-        data: "yioMt9IcQvI8L2wB4rI4Wz9B3Z2x8m7n5p1q4r2s6t8u0v1w3x5y7z9A0b1c2"
-    tls_connection_pool_size: 5
-    priority: 1
-
-  # SECONDARY: Quad9 DNS-over-TLS
-  # Security-focused with DNSSEC, no logging
-  - address_data: ${QUAD9_SECONDARY[0]}
-    tls_port: $STUBBY_TLS_PORT
-    tls_auth_name: "dns.quad9.net"
-    tls_pubkey_pinset:
-      - digest: "sha256"
-        data: "7SpMfnz3Mkk8+k3r+/Cw3Lf7WLIKl0CMbPCmGtEdpZA="
-    tls_connection_pool_size: 4
-    priority: 2
-
-  - address_data: ${QUAD9_SECONDARY[1]}
-    tls_port: $STUBBY_TLS_PORT
-    tls_auth_name: "dns.quad9.net"
-    tls_pubkey_pinset:
-      - digest: "sha256"
-        data: "7SpMfnz3Mkk8+k3r+/Cw3Lf7WLIKl0CMbPCmGtEdpZA="
-    tls_connection_pool_size: 4
-    priority: 2
-
-  # TERTIARY: Google DNS-over-TLS
-  # High availability, global distribution
-  - address_data: ${GOOGLE_TERTIARY[0]}
-    tls_port: $STUBBY_TLS_PORT
-    tls_auth_name: "dns.google"
-    tls_pubkey_pinset:
-      - digest: "sha256"
-        data: "l2H7y2xm4l2H7y2xm4l2H7y2xm4l2H7y2xm4l2H7y2xm4l2H7y2xm4l2H7y2x="
-    tls_connection_pool_size: 4
-    priority: 3
-
-  - address_data: ${GOOGLE_TERTIARY[1]}
-    tls_port: $STUBBY_TLS_PORT
-    tls_auth_name: "dns.google"
-    tls_pubkey_pinset:
-      - digest: "sha256"
-        data: "l2H7y2xm4l2H7y2xm4l2H7y2xm4l2H7y2xm4l2H7y2xm4l2H7y2x="
-    tls_connection_pool_size: 4
-    priority: 3
-
-# Access control - only allow local connections
-access_control_data:
-  - 127.0.0.0/8
-  - ::1/128
-
-# Network settings
-network_timeout: 2000
-connection_retry_delay: 500
-
-# Logging
-log_level: 0
+  # PRIMARY: Cloudflare
 STUBBY_EOF
-)
-    
-    echo "$config_content" > "$STUBBY_CONFIG"
-    chmod 644 "$STUBBY_CONFIG"
-    log INFO "Stubby configuration written to $STUBBY_CONFIG"
+        stubby_upstream "${CLOUDFLARE_PRIMARY[0]}" "cloudflare-dns.com"
+        stubby_upstream "${CLOUDFLARE_PRIMARY[1]}" "cloudflare-dns.com"
+        echo "  # SECONDARY: Quad9"
+        stubby_upstream "${QUAD9_SECONDARY[0]}" "dns.quad9.net"
+        stubby_upstream "${QUAD9_SECONDARY[1]}" "dns.quad9.net"
+        echo "  # TERTIARY: Google"
+        stubby_upstream "${GOOGLE_TERTIARY[0]}" "dns.google"
+        stubby_upstream "${GOOGLE_TERTIARY[1]}" "dns.google"
+    } | write_file "$STUBBY_CONFIG" 644
 }
 
 # ============================================================================
@@ -273,125 +278,96 @@ STUBBY_EOF
 
 generate_dnsmasq_config() {
     log INFO "Generating DNSMasq configuration..."
-    
-    mkdir -p "$DNSMASQ_D"
-    
-    local config_content
-    config_content=$(cat << DNSMASQ_EOF
+    write_file "$DNSMASQ_DROPIN" 644 << DNSMASQ_EOF
 # DNSMasq configuration generated by SetDNScache
 # $(date '+%Y-%m-%d %H:%M:%S')
 #
-# Forward all DNS queries to Stubby (127.0.0.1:$STUBBY_PORT)
-# for DNS-over-TLS resolution
+# Cache on 127.0.0.1:$DNS_PORT, forward everything to Stubby (127.0.0.1:$STUBBY_PORT)
 
-# Listen on localhost only
 listen-address=127.0.0.1
 bind-interfaces
 port=$DNS_PORT
 
-# Don't use /etc/resolv.conf
+# Upstream is Stubby only; ignore /etc/resolv.conf
 no-resolv
 no-poll
-
-# Forward to Stubby
 server=127.0.0.1#$STUBBY_PORT
 
-# Cache size (adjust based on system memory)
 cache-size=1000
 
-# DNSSEC validation (requires stubby to do the actual validation)
-# DNSMasq will pass through the AD (authentic data) bit
-dnssec
-dnssec-check-unsigned=no
+# DNSSEC: pass the DO bit and the upstream AD flag through unchanged.
+# Validation is done by the upstream resolvers (Cloudflare/Quad9/Google).
+proxy-dnssec
 
-# Don't read /etc/hosts
-no-hosts
-
-# Add domain to short names
+# Never forward plain names without dots or private reverse lookups upstream
 domain-needed
+bogus-priv
 
-# Log queries (optional, for debugging)
-# log-queries
-
-# Maximum concurrent queries
-queries-per-server=100
-all-servers
-
-# EDNS0 for larger DNS packets
 edns-packet-max=4096
-
-# Local domain (optional, comment out if not needed)
-# local=/local.lan/
-# domain=local.lan
-
-# Block ads and malware (optional Quad9 blocklist)
-# server=/ads.example.com/# (use blocklists if desired)
-
-# TTL for cache entries
 neg-ttl=600
 max-ttl=3600
 DNSMASQ_EOF
-)
-    
-    echo "$config_content" > "$DNSMASQ_D/stubby-forward.conf"
-    chmod 644 "$DNSMASQ_D/stubby-forward.conf"
-    log INFO "DNSMasq configuration written to $DNSMASQ_D/stubby-forward.conf"
+}
+
+# ============================================================================
+# systemd-resolved / resolv.conf integration
+# ============================================================================
+
+configure_system_resolver() {
+    log INFO "Pointing the system resolver at 127.0.0.1..."
+    if command -v systemctl &>/dev/null && systemctl is-active "$RESOLVED_SERVICE" &>/dev/null; then
+        record_service_state "$RESOLVED_SERVICE"
+        backup_config "$RESOLVED_DROPIN"
+        write_file "$RESOLVED_DROPIN" 644 << RESOLVED_EOF
+# Generated by SetDNScache - remove (or run --rollback) to undo
+[Resolve]
+DNS=127.0.0.1
+Domains=~.
+DNSStubListener=no
+RESOLVED_EOF
+        # With the stub listener off, 127.0.0.53 goes away; use the full file.
+        if [ -L /etc/resolv.conf ] && [[ "$(readlink /etc/resolv.conf)" == *stub-resolv.conf ]]; then
+            backup_config /etc/resolv.conf
+            run ln -sfn /run/systemd/resolve/resolv.conf /etc/resolv.conf
+        fi
+        run systemctl restart "$RESOLVED_SERVICE"
+    else
+        log WARN "systemd-resolved not active; writing /etc/resolv.conf directly"
+        log WARN "NetworkManager/DHCP may overwrite it; configure your network manager to use 127.0.0.1"
+        backup_config /etc/resolv.conf
+        if [ -L /etc/resolv.conf ]; then
+            run rm -f /etc/resolv.conf
+        fi
+        printf 'nameserver 127.0.0.1\noptions edns0 trust-ad\n' | write_file /etc/resolv.conf 644
+    fi
 }
 
 # ============================================================================
 # Systemd Service Management
 # ============================================================================
 
-enable_services() {
-    log INFO "Enabling and starting services..."
-    
-    # Enable Stubby
-    if systemctl is-enabled "$STUBBY_SERVICE" &>/dev/null; then
-        log INFO "Stubby already enabled"
-    else
-        systemctl enable "$STUBBY_SERVICE"
-        log INFO "Enabled Stubby service"
-    fi
-    
-    # Enable DNSMasq
-    if systemctl is-enabled "$DNSMASQ_SERVICE" &>/dev/null; then
-        log INFO "DNSMasq already enabled"
-    else
-        systemctl enable "$DNSMASQ_SERVICE"
-        log INFO "Enabled DNSMasq service"
-    fi
+enable_and_restart_services() {
+    log INFO "Enabling and (re)starting services..."
+    record_service_state "$STUBBY_SERVICE"
+    record_service_state "$DNSMASQ_SERVICE"
+    run systemctl enable "$STUBBY_SERVICE"
+    run systemctl restart "$STUBBY_SERVICE"
+    [ "$DRY_RUN" = true ] || sleep 2
+    run systemctl enable "$DNSMASQ_SERVICE"
+    run systemctl restart "$DNSMASQ_SERVICE"
 }
 
-restart_services() {
-    log INFO "Restarting services..."
-    
-    # Restart Stubby first
-    if systemctl is-active "$STUBBY_SERVICE" &>/dev/null; then
-        systemctl restart "$STUBBY_SERVICE"
-        log INFO "Restarted Stubby"
-    else
-        systemctl start "$STUBBY_SERVICE"
-        log INFO "Started Stubby"
-    fi
-    
-    # Wait for Stubby to be ready
-    sleep 2
-    
-    # Restart DNSMasq
-    if systemctl is-active "$DNSMASQ_SERVICE" &>/dev/null; then
-        systemctl restart "$DNSMASQ_SERVICE"
-        log INFO "Restarted DNSMasq"
-    else
-        systemctl start "$DNSMASQ_SERVICE"
-        log INFO "Started DNSMasq"
-    fi
-}
-
-stop_services() {
-    log INFO "Stopping services..."
-    
-    systemctl stop "$DNSMASQ_SERVICE" 2>/dev/null || true
-    systemctl stop "$STUBBY_SERVICE" 2>/dev/null || true
+local_resolver_works() {
+    [ "$DRY_RUN" = true ] && return 0
+    local tries
+    for tries in 1 2 3 4 5; do
+        if [ -n "$(dig +short +time=2 +tries=1 example.com @127.0.0.1 -p "$DNS_PORT" 2>/dev/null || true)" ]; then
+            return 0
+        fi
+        log DEBUG "local resolver not answering yet (attempt $tries)"
+        sleep 1
+    done
+    return 1
 }
 
 # ============================================================================
@@ -399,75 +375,76 @@ stop_services() {
 # ============================================================================
 
 test_connectivity() {
-    log_section "Connectivity Test Results"
+    local phase="${1:-current}"
+    log_section "Connectivity Test Results ($phase)"
     
     local passed=0
     local failed=0
     
     echo ""
-    echo "Running pre-configuration connectivity tests..."
+    echo "Running $phase connectivity tests..."
     echo ""
     
     # Test 1: DNS Resolution
     echo "--- DNS Resolution Test ---"
     if test_dns_resolution; then
-        ((passed++))
+        passed=$((passed + 1))
     else
-        ((failed++))
+        failed=$((failed + 1))
     fi
     
     # Test 2: Port Connectivity
     echo ""
     echo "--- Port Connectivity Test ---"
     if test_port_connectivity; then
-        ((passed++))
+        passed=$((passed + 1))
     else
-        ((failed++))
+        failed=$((failed + 1))
     fi
     
     # Test 3: Service Status
     echo ""
     echo "--- Service Status Test ---"
     if test_service_status; then
-        ((passed++))
+        passed=$((passed + 1))
     else
-        ((failed++))
+        failed=$((failed + 1))
     fi
     
     # Test 4: DNSSEC Validation
     echo ""
     echo "--- DNSSEC Validation Test ---"
     if test_dnssec_validation; then
-        ((passed++))
+        passed=$((passed + 1))
     else
-        ((failed++))
+        failed=$((failed + 1))
     fi
     
     # Test 5: Latency Test
     echo ""
     echo "--- Latency Test ---"
     if test_latency; then
-        ((passed++))
+        passed=$((passed + 1))
     else
-        ((failed++))
+        failed=$((failed + 1))
     fi
     
     # Test 6: Fallback Servers
     echo ""
     echo "--- Fallback Server Test ---"
     if test_fallback_servers; then
-        ((passed++))
+        passed=$((passed + 1))
     else
-        ((failed++))
+        failed=$((failed + 1))
     fi
     
     # Test 7: Conflict Detection
     echo ""
     echo "--- Conflict Detection Test ---"
     if test_conflict_detection; then
-        ((passed++))
+        passed=$((passed + 1))
     else
-        ((failed++))
+        failed=$((failed + 1))
     fi
     
     echo ""
@@ -516,15 +493,15 @@ test_port_connectivity() {
     local stubby_listening=false
     
     # Test DNSMasq (port 53)
-    if ss -tuln 2>/dev/null | grep -q ":$DNS_PORT " || netstat -tuln 2>/dev/null | grep -q ":$DNS_PORT "; then
+    if ss -tuln 2>/dev/null | grep -qE "[:.]$DNS_PORT\s" || netstat -tuln 2>/dev/null | grep -qE "[:.]$DNS_PORT\s"; then
         log INFO "  ✓ DNSMasq listening on 127.0.0.1:$DNS_PORT"
         dnsmasq_listening=true
     else
         log WARN "  ✗ DNSMasq not detected on 127.0.0.1:$DNS_PORT"
     fi
     
-    # Test Stubby (port 5353)
-    if ss -tuln 2>/dev/null | grep -q ":$STUBBY_PORT " || netstat -tuln 2>/dev/null | grep -q ":$STUBBY_PORT "; then
+    # Test Stubby ($STUBBY_PORT)
+    if ss -tuln 2>/dev/null | grep -qE "[:.]$STUBBY_PORT\s" || netstat -tuln 2>/dev/null | grep -qE "[:.]$STUBBY_PORT\s"; then
         log INFO "  ✓ Stubby listening on 127.0.0.1:$STUBBY_PORT"
         stubby_listening=true
     else
@@ -598,7 +575,7 @@ test_dnssec_validation() {
     # The AD (Authenticated Data) flag indicates successful DNSSEC validation
     local test_domain="dnssec-examples.com"
     local result
-    result=$(dig +short "$test_domain" @127.0.0.1 -p "$DNS_PORT" +dnssec 2>/dev/null)
+    result=$(dig +short "$test_domain" @127.0.0.1 -p "$DNS_PORT" +dnssec 2>/dev/null || true)
     
     if [ -n "$result" ]; then
         log INFO "  ✓ DNSSEC query returned results"
@@ -614,7 +591,7 @@ test_dnssec_validation() {
     
     # Alternative: Check if DNSSEC is being requested
     local dnssec_check
-    dnssec_check=$(dig +noall +answer +dnssec +short sigok.verteiltesysteme.net @127.0.0.1 -p "$DNS_PORT" 2>/dev/null)
+    dnssec_check=$(dig +noall +answer +dnssec +short sigok.verteiltesysteme.net @127.0.0.1 -p "$DNS_PORT" 2>/dev/null || true)
     
     if [ -n "$dnssec_check" ]; then
         log INFO "  ✓ DNSSEC validation working (sigok.verteiltesysteme.net)"
@@ -622,7 +599,7 @@ test_dnssec_validation() {
         return 0
     else
         # Try another test
-        dnssec_check=$(dig +noall +answer +dnssec +short dnssec.verteiltesysteme.net @127.0.0.1 -p "$DNS_PORT" 2>/dev/null)
+        dnssec_check=$(dig +noall +answer +dnssec +short dnssec.verteiltesysteme.net @127.0.0.1 -p "$DNS_PORT" 2>/dev/null || true)
         if [ -n "$dnssec_check" ]; then
             log INFO "  ✓ DNSSEC validation working (dnssec.verteiltesysteme.net)"
             log INFO "DNSSEC Validation Test: PASSED"
@@ -648,12 +625,12 @@ test_latency() {
         # Multiple queries to test caching
         for i in {1..3}; do
             start=$(date +%s%N)
-            dig +short "$domain" @127.0.0.1 -p "$DNS_PORT" &>/dev/null
+            dig +short "$domain" @127.0.0.1 -p "$DNS_PORT" &>/dev/null || true
             end=$(date +%s%N)
             
             duration=$(( (end - start) / 1000000 ))
             
-            if [ $duration -lt $max_latency ]; then
+            if [ "$duration" -lt "$max_latency" ]; then
                 log DEBUG "  $domain query $i: ${duration}ms (cached, acceptable)"
             else
                 log DEBUG "  $domain query $i: ${duration}ms (uncached, may be high)"
@@ -663,14 +640,14 @@ test_latency() {
     
     # Test with dig +stats for accurate timing
     local stats
-    stats=$(dig google.com @127.0.0.1 -p "$DNS_PORT" +stats 2>&1 | grep "Query time:")
+    stats=$(dig google.com @127.0.0.1 -p "$DNS_PORT" +stats 2>&1 | grep "Query time:" || true)
     
     if [ -n "$stats" ]; then
         local query_time
         query_time=$(echo "$stats" | awk '{print $4}')
         log INFO "  Query time for google.com: ${query_time}ms"
         
-        if [ "$query_time" -lt 100 ]; then
+        if [[ "$query_time" =~ ^[0-9]+$ ]] && [ "$query_time" -lt "$max_latency" ]; then
             log INFO "  ✓ Latency is under ${max_latency}ms threshold"
         else
             log WARN "  ! Latency is over ${max_latency}ms threshold"
@@ -747,21 +724,20 @@ test_conflict_detection() {
     log INFO "Testing for port conflicts with other DNS services..."
     
     local conflicts_found=false
+    local conflicting_process
     
     # Check if anything is already using port 53
-    if ss -tuln 2>/dev/null | grep -q ":$DNS_PORT "; then
-        local conflicting_process
-        conflicting_process=$(ss -tlnp 2>/dev/null | grep ":$DNS_PORT " | awk '{print $7}' || echo "unknown")
+    if ss -tuln 2>/dev/null | grep -qE "[:.]$DNS_PORT\s"; then
+        conflicting_process=$(ss -tlnp 2>/dev/null | grep -E "[:.]$DNS_PORT\s" | awk '{print $7}' || echo "unknown")
         log WARN "  ✗ Port $DNS_PORT is already in use by: $conflicting_process"
         log WARN "  This may cause DNS resolution failures"
         log INFO "  Remediation: Stop the conflicting service or change the port"
         conflicts_found=true
     fi
     
-    # Check if anything is already using port 5353
-    if ss -tuln 2>/dev/null | grep -q ":$STUBBY_PORT "; then
-        local conflicting_process
-        conflicting_process=$(ss -tlnp 2>/dev/null | grep ":$STUBBY_PORT " | awk '{print $7}' || echo "unknown")
+    # Check if anything is already using the Stubby port
+    if ss -tuln 2>/dev/null | grep -qE "[:.]$STUBBY_PORT\s"; then
+        conflicting_process=$(ss -tlnp 2>/dev/null | grep -E "[:.]$STUBBY_PORT\s" | awk '{print $7}' || echo "unknown")
         log WARN "  ✗ Port $STUBBY_PORT is already in use by: $conflicting_process"
         log INFO "  Remediation: Stop the conflicting service or change the port"
         conflicts_found=true
@@ -772,7 +748,11 @@ test_conflict_detection() {
     
     for service in "${conflicting_services[@]}"; do
         if command -v systemctl &>/dev/null; then
-            if systemctl is-active "$service" &>/dev/null; then
+            if [ "$service" = "systemd-resolved" ]; then
+                if systemctl is-active "$service" &>/dev/null; then
+                    log INFO "  i systemd-resolved is active; setup installs $RESOLVED_DROPIN (DNSStubListener=no)"
+                fi
+            elif systemctl is-active "$service" &>/dev/null; then
                 log WARN "  ! $service is running and may conflict"
                 log INFO "  Remediation: sudo systemctl stop $service"
             fi
@@ -795,100 +775,143 @@ test_conflict_detection() {
 
 configure_secure_dns() {
     log_section "Secure DNS Configuration"
-    
-    # Pre-flight checks
+    [ "$DRY_RUN" = true ] && log INFO "DRY RUN: no changes will be made"
+
     check_root
     check_dependencies
-    
-    # Run pre-configuration tests
+
     log INFO "Running pre-configuration connectivity tests..."
-    test_connectivity || true
-    
+    test_connectivity "pre-configuration" || true
+
+    if [ "$DRY_RUN" != true ]; then
+        mkdir -p "$STATE_DIR"
+        chmod 700 "$STATE_DIR"
+        state_add "run=$(date '+%Y-%m-%d %H:%M:%S')"
+    fi
+
     log_section "Configuring Stubby with DNS-over-TLS"
-    
-    # Backup existing configuration
-    if [ -f "$STUBBY_CONFIG" ]; then
-        backup_config "$STUBBY_CONFIG" > /dev/null
-    fi
-    
-    # Generate new configuration
+    backup_config "$STUBBY_CONFIG"
     generate_stubby_config
-    
+
     log_section "Configuring DNSMasq"
-    
-    # Backup existing configuration
-    if [ -f "$DNSMASQ_CONFIG" ]; then
-        backup_config "$DNSMASQ_CONFIG" > /dev/null
-    fi
-    
-    # Generate DNSMasq configuration
+    backup_config "$DNSMASQ_DROPIN"
     generate_dnsmasq_config
-    
+
     log_section "Starting Services"
-    
-    # Enable and start services
-    enable_services
-    restart_services
-    
+    enable_and_restart_services
+
+    # Only switch the system resolver once the new chain answers, so a failure
+    # here never leaves the machine without DNS.
+    if ! local_resolver_works; then
+        log ERROR "dnsmasq/stubby on 127.0.0.1 are not answering; system resolver left unchanged"
+        log INFO "Inspect: journalctl -u stubby -u dnsmasq ; undo with: sudo $0 --rollback"
+        exit 1
+    fi
+
+    log_section "Configuring System Resolver"
+    configure_system_resolver
+
     log_section "Post-Configuration Verification"
-    
-    # Run post-configuration tests
-    sleep 3  # Give services time to initialize
-    test_connectivity
-    
+    [ "$DRY_RUN" = true ] || sleep 2
+    local failed=0
+    if [ "$DRY_RUN" = true ]; then
+        log INFO "[DRY RUN] skipping post-configuration tests"
+    else
+        test_connectivity "post-configuration" || failed=$?
+    fi
+
     log_section "Configuration Complete"
-    
-    log INFO "Secure DNS configuration completed successfully!"
-    log INFO ""
+    if [ "$failed" -ne 0 ]; then
+        log WARN "Configuration applied but $failed post-configuration test(s) failed (see above)"
+    else
+        log INFO "Secure DNS configuration completed successfully!"
+    fi
     log INFO "Configuration Summary:"
-    log INFO "  - Stubby: $STUBBY_CONFIG"
-    log INFO "  - DNSMasq: $DNSMASQ_D/stubby-forward.conf"
-    log INFO "  - Primary DNS:   Cloudflare (1.1.1.1, 1.0.0.1)"
-    log INFO "  - Secondary DNS: Quad9 (9.9.9.9, 149.112.112.112)"
-    log INFO "  - Tertiary DNS:  Google (8.8.8.8, 8.8.4.4)"
-    log INFO ""
-    log INFO "To verify your DNS configuration:"
-    log INFO "  dig @127.0.0.1 google.com"
-    log INFO ""
-    log INFO "To check service status:"
-    log INFO "  sudo systemctl status stubby"
-    log INFO "  sudo systemctl status dnsmasq"
+    log INFO "  - Stubby:   $STUBBY_CONFIG (127.0.0.1:$STUBBY_PORT)"
+    log INFO "  - DNSMasq:  $DNSMASQ_DROPIN (127.0.0.1:$DNS_PORT)"
+    log INFO "  - Resolved: $RESOLVED_DROPIN"
+    log INFO "  - State:    $STATE_FILE (used by --rollback)"
+    log INFO "Verify: dig @127.0.0.1 example.com ; resolvectl status"
+    return "$failed"
 }
 
 # ============================================================================
-# Rollback Function
+# Rollback Function (replays the state file in reverse)
 # ============================================================================
+
+restore_service() {
+    local svc="$1" enabled="$2" active="$3"
+    case "$enabled" in
+        enabled) run systemctl enable "$svc" || true ;;
+        disabled|"") run systemctl disable "$svc" || true ;;
+        masked) run systemctl mask "$svc" || true ;;
+        *) log DEBUG "leaving enablement of $svc ($enabled)" ;;
+    esac
+    if [ "$active" = "active" ]; then
+        run systemctl restart "$svc" || log WARN "could not restart $svc"
+    else
+        run systemctl stop "$svc" || true
+    fi
+}
 
 rollback() {
     log_section "Rolling Back Configuration"
-    
     check_root
-    
-    # Stop services
-    stop_services
-    
-    # Restore Stubby backup
-    local stubby_backups
-    stubby_backups=$(ls -1 /etc/stubby/stubby.yml.bak.* 2>/dev/null | tail -1 || true)
-    if [ -n "$stubby_backups" ]; then
-        restore_backup "$stubby_backups"
-        log INFO "Restored Stubby configuration"
-    else
-        log INFO "No Stubby backup found to restore"
+
+    if [ ! -f "$STATE_FILE" ]; then
+        log ERROR "No state file at $STATE_FILE - nothing recorded to roll back"
+        exit 1
     fi
-    
-    # Remove DNSMasq configuration
-    if [ -f "$DNSMASQ_D/stubby-forward.conf" ]; then
-        rm "$DNSMASQ_D/stubby-forward.conf"
-        log INFO "Removed DNSMasq configuration"
+
+    local -a records=() services=()
+    mapfile -t records < "$STATE_FILE"
+    local i rec key val file backup
+    for (( i=${#records[@]}-1; i>=0; i-- )); do
+        rec="${records[$i]}"
+        key="${rec%%=*}"
+        val="${rec#*=}"
+        case "$key" in
+            backup)
+                file="${val%%|*}"; backup="${val#*|}"
+                if [ -e "$backup" ] || [ -L "$backup" ]; then
+                    run cp -a --remove-destination "$backup" "$file"
+                    log INFO "Restored $file from $backup (backup kept)"
+                else
+                    log WARN "Backup $backup missing; cannot restore $file"
+                fi
+                ;;
+            created)
+                if [ -e "$val" ] || [ -L "$val" ]; then
+                    run rm -f "$val"
+                    log INFO "Removed $val (did not exist before)"
+                fi
+                ;;
+            service)
+                services+=("$val")   # reverse order: earliest (original) last
+                ;;
+            run) ;;
+            *) log WARN "Unknown state record: $rec" ;;
+        esac
+    done
+
+    # Restore services; the last record for each service is its original state.
+    local -A final=()
+    local s
+    for s in "${services[@]}"; do
+        final["${s%%|*}"]="$s"
+    done
+    for s in "$STUBBY_SERVICE" "$DNSMASQ_SERVICE" "$RESOLVED_SERVICE"; do
+        if [ -n "${final[$s]:-}" ]; then
+            IFS='|' read -r _ en ac <<< "${final[$s]}"
+            log INFO "Restoring $s to enabled=$en active=$ac"
+            restore_service "$s" "$en" "$ac"
+        fi
+    done
+
+    if [ "$DRY_RUN" != true ]; then
+        mv "$STATE_FILE" "$STATE_FILE.rolledback.$(date +%Y%m%d%H%M%S)"
     fi
-    
-    # Restart services
-    systemctl start stubby 2>/dev/null || true
-    systemctl start dnsmasq 2>/dev/null || true
-    
-    log INFO "Rollback completed"
-    log INFO "Note: Services have been restarted with original configurations"
+    log INFO "Rollback completed (backup files were kept)"
 }
 
 # ============================================================================
@@ -905,41 +928,31 @@ USAGE:
 OPTIONS:
     --run-tests     Run connectivity tests only (no configuration changes)
     --test-reboot   Run comprehensive reboot survival tests
-    --rollback      Restore previous configuration and exit
+    --rollback      Restore the configuration recorded in $STATE_FILE
+    --dry-run       Show every change that would be made; changes nothing
+                    (does not require root)
+    --yes, -y       Do not prompt before installing missing packages
     --verbose       Enable verbose output
-    --dry-run       Show what would be done without making changes
     --help          Show this help message
 
-EXAMPLES:
-    sudo $0                     # Configure secure DNS
-    sudo $0 --run-tests         # Run connectivity tests only
-    sudo $0 --test-reboot       # Run comprehensive reboot survival tests
-    sudo $0 --rollback          # Rollback to previous configuration
-    sudo $0 --verbose           # Run with verbose output
+Options may be given in any order; one action (--run-tests, --test-reboot,
+--rollback) at most.
+
+WHAT IT CHANGES:
+    $STUBBY_CONFIG              Stubby DNS-over-TLS on 127.0.0.1:$STUBBY_PORT
+    $DNSMASQ_DROPIN    dnsmasq cache on 127.0.0.1:$DNS_PORT
+    $RESOLVED_DROPIN   systemd-resolved -> 127.0.0.1, stub listener off
+    All originals are backed up (*.bak.TIMESTAMP) and recorded in $STATE_FILE.
 
 DNS SERVER HIERARCHY:
     PRIMARY:   Cloudflare (1.1.1.1, 1.0.0.1)
     SECONDARY: Quad9 (9.9.9.9, 149.112.112.112)
     TERTIARY:  Google (8.8.8.8, 8.8.4.4)
 
-TESTS PERFORMED:
-    1. DNS resolution test (multiple domains)
-    2. Port connectivity test (53, 5353)
-    3. Service status test (systemd)
-    4. DNSSEC validation test
-    5. Latency test (<100ms for cached)
-    6. Fallback server test
-    7. Conflict detection test
-
-SUPPORTED SYSTEMS:
-    - Debian 10+
-    - Ubuntu 18.04+
-    - Other systemd-based distributions (may require package name adjustments)
-
 EXIT CODES:
     0   Success
-    1   Error (missing dependencies, permission denied, etc.)
-
+    1   Error (missing dependencies, permission denied, resolver not answering)
+    N   Configuration applied but N post-configuration tests failed
 HELP
 }
 
@@ -949,32 +962,26 @@ HELP
 
 run_reboot_tests() {
     log INFO "Running comprehensive reboot survival tests..."
-    
-    # Detect script directory for relative paths
-    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local project_root="$(dirname "$script_dir")"
-    
-    # Check if test scripts exist
-    local pre_reboot_script="$project_root/tests/pre-reboot-check.sh"
-    local post_reboot_script="$project_root/tests/post-reboot-check.sh"
+
+    local script_dir project_root
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    project_root="$(dirname "$script_dir")"
+
     local reboot_helper="$project_root/tests/reboot-test-helper.sh"
-    
-    if [ ! -f "$pre_reboot_script" ] || [ ! -f "$post_reboot_script" ] || [ ! -f "$reboot_helper" ]; then
-        log ERROR "Reboot test scripts not found. Please ensure tests directory exists."
-        log INFO "Expected location: $project_root/tests/"
-        exit 1
-    fi
-    
-    # Check if scripts are executable
-    if [ ! -x "$pre_reboot_script" ] || [ ! -x "$post_reboot_script" ] || [ ! -x "$reboot_helper" ]; then
-        log ERROR "Reboot test scripts are not executable."
-        log INFO "Please run: chmod +x $project_root/tests/*.sh"
-        exit 1
-    fi
-    
+    local f
+    for f in pre-reboot-check.sh post-reboot-check.sh reboot-test-helper.sh; do
+        if [ ! -f "$project_root/tests/$f" ]; then
+            log ERROR "Reboot test script not found: $project_root/tests/$f"
+            exit 1
+        fi
+        if [ ! -x "$project_root/tests/$f" ]; then
+            log ERROR "Reboot test script not executable: $project_root/tests/$f"
+            log INFO "Please run: chmod +x $project_root/tests/*.sh"
+            exit 1
+        fi
+    done
+
     log INFO "Starting reboot test helper..."
-    
-    # Run the reboot test helper
     "$reboot_helper"
 }
 
@@ -982,51 +989,53 @@ run_reboot_tests() {
 # Main Entry Point
 # ============================================================================
 
-main() {
-    # Parse command line arguments
+set_action() {
+    if [ "$ACTION" != "configure" ] && [ "$ACTION" != "$1" ]; then
+        log ERROR "Options --$ACTION and --$1 cannot be combined"
+        exit 1
+    fi
+    ACTION="$1"
+}
+
+parse_args() {
+    # Parse everything first so flags like --verbose/--dry-run apply
+    # regardless of their position on the command line.
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --run-tests)
-                RUN_TESTS_ONLY=true
-                shift
-                ;;
-            --test-reboot)
-                run_reboot_tests
-                exit 0
-                ;;
-            --rollback)
-                rollback
-                exit 0
-                ;;
-            --verbose)
-                VERBOSE=true
-                shift
-                ;;
-            --dry-run)
-                DRY_RUN=true
-                shift
-                ;;
-            --help)
-                show_help
-                exit 0
-                ;;
+            --run-tests)   set_action "run-tests" ;;
+            --test-reboot) set_action "test-reboot" ;;
+            --rollback)    set_action "rollback" ;;
+            --verbose)     VERBOSE=true ;;
+            --dry-run)     DRY_RUN=true ;;
+            --yes|-y)      ASSUME_YES=true ;;
+            --help|-h)     ACTION="help" ;;
             *)
                 log ERROR "Unknown option: $1"
                 show_help
                 exit 1
                 ;;
         esac
+        shift
     done
-    
-    if [ "$RUN_TESTS_ONLY" = true ]; then
-        log INFO "Running connectivity tests only (no configuration changes)..."
-        check_dependencies || true
-        test_connectivity
-        exit $?
-    fi
-    
-    configure_secure_dns
 }
 
-# Run main function
-main "$@"
+main() {
+    parse_args "$@"
+
+    case "$ACTION" in
+        help)        show_help ;;
+        test-reboot) run_reboot_tests ;;
+        rollback)    rollback ;;
+        run-tests)
+            log INFO "Running connectivity tests only (no configuration changes)..."
+            DRY_RUN=true check_dependencies || true
+            test_connectivity "current"
+            ;;
+        configure)   configure_secure_dns ;;
+    esac
+}
+
+# Allow sourcing for unit tests without running anything.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
