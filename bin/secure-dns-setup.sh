@@ -25,6 +25,11 @@ RESOLVED_DROPIN_DIR="${RESOLVED_DROPIN_DIR:-/etc/systemd/resolved.conf.d}"
 RESOLVED_DROPIN="$RESOLVED_DROPIN_DIR/setdnscache.conf"
 STATE_DIR="${STATE_DIR:-/var/lib/setdnscache}"
 STATE_FILE="$STATE_DIR/state"
+# Backups live outside every config dir: dnsmasq (and others) load *all* files
+# in their conf dirs, so a *.bak next to the original gets parsed too.
+BACKUP_DIR="${BACKUP_DIR:-$STATE_DIR/backups}"
+DNSMASQ_CONF="${DNSMASQ_CONF:-/etc/dnsmasq.conf}"
+RUN_TS="$(date +%Y%m%d%H%M%S)"
 # 5353 is mDNS (avahi-daemon) on most desktops, so use 5453 for Stubby.
 STUBBY_PORT="${STUBBY_PORT:-5453}"
 DNS_PORT=53
@@ -240,16 +245,72 @@ check_dependencies() {
 # ============================================================================
 
 # Back up FILE (if it exists) and record it in the state file. Backups are kept.
+backup_path_for() {
+    # /var/lib/setdnscache/backups/<run-ts>/<original absolute path>
+    local file="$1" dest n=1
+    dest="$BACKUP_DIR/$RUN_TS$file"
+    while [ -e "$dest" ] || [ -L "$dest" ]; do dest="$BACKUP_DIR/$RUN_TS$file.$n"; n=$((n + 1)); done
+    echo "$dest"
+}
+
 backup_config() {
     local file="$1" backup
-    backup="${file}.bak.$(date +%Y%m%d%H%M%S)"
     if [ -e "$file" ] || [ -L "$file" ]; then
+        backup=$(backup_path_for "$file")
+        run mkdir -p "$(dirname "$backup")"
         run cp -a "$file" "$backup"
         state_add "backup=$file|$backup"
         [ "$DRY_RUN" = true ] || log INFO "Backed up $file -> $backup"
     else
         state_add "created=$file"
     fi
+}
+
+# Earlier versions left *.bak.TIMESTAMP next to the originals; in dnsmasq.d
+# they are loaded as config and break dnsmasq. Move them into BACKUP_DIR and
+# rewrite matching state records so --rollback still finds them.
+migrate_legacy_backups() {
+    local f dest moved=0
+    for f in "$DNSMASQ_D"/*.bak.[0-9]* "$(dirname "$STUBBY_CONFIG")"/*.bak.[0-9]* \
+             "$RESOLVED_DROPIN_DIR"/*.bak.[0-9]*; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        dest="$BACKUP_DIR/legacy$f"
+        if [ "$DRY_RUN" = true ]; then
+            log INFO "[DRY RUN] would move legacy backup $f -> $dest"
+            continue
+        fi
+        mkdir -p "$(dirname "$dest")"
+        mv "$f" "$dest"
+        if [ -f "$STATE_FILE" ]; then
+            F="$f" D="$dest" awk '{ i = index($0, "|" ENVIRON["F"]); if (i && substr($0, i + 1) == ENVIRON["F"]) $0 = substr($0, 1, i) ENVIRON["D"]; print }' \
+                "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+        fi
+        log INFO "Moved legacy backup $f -> $dest"
+        moved=$((moved + 1))
+    done
+    [ "$moved" -eq 0 ] || chmod -R go-rwx "$BACKUP_DIR"
+}
+
+# Validate the complete dnsmasq config the service will load, before restart.
+# Debian's dnsmasq service adds the conf-dir itself (-7 /etc/dnsmasq.d,...),
+# unless dnsmasq.conf already declares one.
+dnsmasq_config_test() {
+    local -a args=(--test)
+    [ -f "$DNSMASQ_CONF" ] && args+=("--conf-file=$DNSMASQ_CONF")
+    if ! { [ -f "$DNSMASQ_CONF" ] && grep -Eq '^[[:space:]]*conf-dir=' "$DNSMASQ_CONF"; }; then
+        args+=("--conf-dir=$DNSMASQ_D,.dpkg-dist,.dpkg-old,.dpkg-new")
+    fi
+    if [ "$DRY_RUN" = true ]; then
+        log INFO "[DRY RUN] would run: dnsmasq ${args[*]}"
+        return 0
+    fi
+    local out
+    if out=$(dnsmasq "${args[@]}" 2>&1); then
+        log INFO "dnsmasq configuration check passed"
+        return 0
+    fi
+    log ERROR "dnsmasq configuration check failed: $out"
+    return 1
 }
 
 record_service_state() {
@@ -908,8 +969,12 @@ configure_secure_dns() {
         mkdir -p "$STATE_DIR"
         chmod 700 "$STATE_DIR"
         state_add "run=$(date '+%Y-%m-%d %H:%M:%S')"
+        mkdir -p "$BACKUP_DIR"
+        chmod 700 "$BACKUP_DIR"
         trap 'rc=$?; log ERROR "Setup failed (exit $rc). Changes so far are recorded in $STATE_FILE; undo with: sudo $0 --rollback"' ERR
     fi
+
+    migrate_legacy_backups
 
     log_section "Configuring Stubby with DNS-over-TLS"
     backup_config "$STUBBY_CONFIG"
@@ -918,11 +983,18 @@ configure_secure_dns() {
     log_section "Configuring DNSMasq"
     backup_config "$DNSMASQ_DROPIN"
     generate_dnsmasq_config
+    if ! dnsmasq_config_test; then
+        log ERROR "Aborting before any service restart."
+        log ERROR "System resolver (systemd-resolved) was NOT changed; DNS still works as before."
+        log INFO "To undo the partial setup run: sudo $0 --rollback"
+        exit 1
+    fi
 
     log_section "Starting Services"
     if ! enable_and_restart_services; then
-        log ERROR "Starting services failed. Inspect: journalctl -u stubby -u dnsmasq"
-        log INFO "Changes so far are recorded in $STATE_FILE; undo with: sudo $0 --rollback"
+        log ERROR "Starting services failed. Inspect: systemctl status stubby dnsmasq ; journalctl -xeu dnsmasq"
+        log ERROR "System resolver (systemd-resolved) was NOT changed; DNS still works as before."
+        log INFO "To undo the partial setup run: sudo $0 --rollback"
         exit 1
     fi
 
@@ -1068,7 +1140,7 @@ WHAT IT CHANGES:
     $STUBBY_CONFIG              Stubby DNS-over-TLS on 127.0.0.1:$STUBBY_PORT
     $DNSMASQ_DROPIN    dnsmasq cache on 127.0.0.1:$DNS_PORT
     $RESOLVED_DROPIN   systemd-resolved -> 127.0.0.1, stub listener off
-    All originals are backed up (*.bak.TIMESTAMP) and recorded in $STATE_FILE.
+    All originals are backed up under $BACKUP_DIR/<timestamp>/<path> and recorded in $STATE_FILE.
 
 DNS SERVER HIERARCHY:
     PRIMARY:   Cloudflare (1.1.1.1, 1.0.0.1)

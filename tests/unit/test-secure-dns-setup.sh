@@ -80,7 +80,7 @@ bash -c "source '$SCRIPT'
   backup_config \"\$RESOLVED_DROPIN\"; mkdir -p \"\$RESOLVED_DROPIN_DIR\"; echo x > \"\$RESOLVED_DROPIN\"
   check_root() { :; }; rollback" >/dev/null
 check "rollback restored stubby config" '[ "$(cat "$STUBBY_CONFIG")" = original ]'
-check "rollback kept the backup" 'ls "$STUBBY_CONFIG".bak.* >/dev/null 2>&1'
+check "rollback kept the backup" 'ls "$STATE_DIR"/backups/*"$STUBBY_CONFIG" >/dev/null 2>&1'
 check "rollback removed created dnsmasq drop-in" '[ ! -e "$DNSMASQ_D/stubby-forward.conf" ]'
 check "rollback removed resolved drop-in" '[ ! -e "$TMP/etc/resolved.conf.d/setdnscache.conf" ]'
 check "rollback restored stubby to disabled+stopped" 'grep -qx "disable stubby" "$SYSTEMCTL_LOG" && grep -qx "stop stubby" "$SYSTEMCTL_LOG"'
@@ -165,6 +165,43 @@ check "state records created dnsmasq drop-in" 'grep -q "^created=$DNSMASQ_D/stub
 check "state records original service states" 'grep -q "^service=dnsmasq|" "$STATE_DIR/state"'
 bash -c "source '$SCRIPT'; check_root() { :; }; rollback" >/dev/null 2>&1
 check "rollback after failed run restores stubby config" '[ "$(cat "$STUBBY_CONFIG")" = original ] && [ ! -e "$DNSMASQ_D/stubby-forward.conf" ]'
+
+# 11. Backups outside config dirs, dnsmasq --test, legacy .bak migration
+cat > "$TMP/bin/dnsmasq" <<'FAKE'
+#!/bin/bash
+echo "$*" >> "$TMP_DNSMASQ_LOG"
+[ -n "${DNSMASQ_TEST_FAIL:-}" ] && { echo "dnsmasq: illegal repeated keyword at line 3 of x.bak" >&2; exit 1; }
+echo "dnsmasq: syntax check OK."
+FAKE
+chmod +x "$TMP/bin/dnsmasq"
+export TMP_DNSMASQ_LOG="$TMP/dnsmasq.log" DNSMASQ_CONF="$TMP/etc/dnsmasq.conf"
+RUN='source '"$SCRIPT"'; check_root() { :; }; test_connectivity() { return 0; }; local_resolver_works() { return 0; }; configure_system_resolver() { echo RESOLVER_TOUCHED; }; configure_secure_dns'
+
+rm -rf "${TMP:?}/etc" "${TMP:?}/state" "$TMP_DNSMASQ_LOG"; mkdir -p "$TMP/etc/stubby" "$DNSMASQ_D"
+echo original > "$STUBBY_CONFIG"; echo old > "$DNSMASQ_D/stubby-forward.conf"
+echo legacy > "$DNSMASQ_D/stubby-forward.conf.bak.20261024031951"
+out=$(bash -c "$RUN" 2>&1 || echo "RC=$?")
+check "no backup files left in config dirs" '[ -z "$(find "$TMP/etc" -name "*.bak*")" ]'
+check "backups stored under STATE_DIR/backups/<ts>/<path>" 'ls "$STATE_DIR"/backups/[0-9]*"$STUBBY_CONFIG" "$STATE_DIR"/backups/[0-9]*"$DNSMASQ_D/stubby-forward.conf" >/dev/null'
+check "legacy .bak moved out of dnsmasq.d" '[ -f "$STATE_DIR/backups/legacy$DNSMASQ_D/stubby-forward.conf.bak.20261024031951" ]'
+check "dnsmasq --test ran with conf-dir" 'grep -q -- "--test.*--conf-dir=$DNSMASQ_D" "$TMP_DNSMASQ_LOG"'
+check "successful run reaches resolver step" 'grep -q RESOLVER_TOUCHED <<< "$out"'
+bash -c 'source "'"$SCRIPT"'"; check_root() { :; }; rollback' >/dev/null 2>&1
+check "rollback restores from backup dir" '[ "$(cat "$STUBBY_CONFIG")" = original ] && [ "$(cat "$DNSMASQ_D/stubby-forward.conf")" = old ]'
+
+: > "$SYSTEMCTL_LOG"; rm -rf "${TMP:?}/etc" "${TMP:?}/state" "$TMP_DNSMASQ_LOG"; mkdir -p "$TMP/etc/stubby"; echo original > "$STUBBY_CONFIG"
+out=$(DNSMASQ_TEST_FAIL=1 bash -c "$RUN" 2>&1 || echo "RC=$?")
+check "dnsmasq --test failure aborts" 'grep -q "RC=1" <<< "$out" && grep -q "illegal repeated keyword" <<< "$out"'
+check "no service restarted after failed --test" '! grep -q "^restart" "$SYSTEMCTL_LOG"'
+check "resolver untouched after failed --test" '! grep -q RESOLVER_TOUCHED <<< "$out" && grep -q -- "--rollback" <<< "$out"'
+
+: > "$SYSTEMCTL_LOG"; rm -rf "${TMP:?}/etc" "${TMP:?}/state"; mkdir -p "$TMP/etc/stubby"; echo original > "$STUBBY_CONFIG"
+out=$(FAIL_START="dnsmasq" bash -c "$RUN" 2>&1 || echo "RC=$?")
+check "start failure: resolver untouched + rollback hint" '! grep -q RESOLVER_TOUCHED <<< "$out" && grep -q "NOT changed" <<< "$out" && grep -q -- "--rollback" <<< "$out"'
+
+echo "conf-dir=/etc/dnsmasq.d/,*.conf" > "$DNSMASQ_CONF"; : > "$TMP_DNSMASQ_LOG"
+bash -c 'source "'"$SCRIPT"'"; dnsmasq_config_test' >/dev/null 2>&1
+check "no duplicate conf-dir when dnsmasq.conf has one" '! grep -q -- "--conf-dir" "$TMP_DNSMASQ_LOG"'
 
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
